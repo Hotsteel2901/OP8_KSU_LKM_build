@@ -6,3 +6,4 @@ base_out/
 *.img
 *.ko
 __pycache__/
+!base/boot.img
