@@ -1,0 +1,7 @@
+# build artifacts (if building locally)
+device_kernel/
+kernelsu/
+out_img/
+base_out/
+*.img
+*.ko

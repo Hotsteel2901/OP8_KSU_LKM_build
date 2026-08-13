@@ -1,0 +1,20 @@
+diff --git a/userspace/ksud/src/boot_patch.rs b/userspace/ksud/src/boot_patch.rs
+index f952c2f..3f2163a 100644
+--- a/userspace/ksud/src/boot_patch.rs
++++ b/userspace/ksud/src/boot_patch.rs
+@@ -407,10 +407,11 @@ fn extract_ramdisk(ramdisk_image: &RamdiskImage) -> Result<(Cpio, Option<usize>)
+ }
+ 
+ fn enforce_bootimage_version(boot: &BootImage<'_>) -> Result<()> {
+-    if let BootImageVersion::Android(ver) = boot.get_header().get_version()
+-        && ver < 3
+-    {
+-        bail!("bootimage version {ver} is not supported!")
++    if let BootImageVersion::Android(ver) = boot.get_header().get_version() {
++        println!("- Boot image header version: {ver}");
++        if ver > 4 {
++            bail!("bootimage version {ver} is not supported!")
++        }
+     }
+     Ok(())
+ }

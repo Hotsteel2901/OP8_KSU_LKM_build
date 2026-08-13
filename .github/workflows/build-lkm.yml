@@ -1,0 +1,214 @@
+name: Build Non-GKI LKM Kernel (OnePlus 8 / LOS 23.2)
+
+# 自动拉取 backslashxx/KernelSU 最新 master 提交,集成 LKM(kernelsu.ko + ksud)
+# + Re:Kernel + DroidSpaces,产出可 fastboot 直刷的 boot.img(v2 header)。
+#
+# 前置: 需要一个 v2 boot.img 作为基底(提供内核 Image/DTB 之外的 ramdisk+dtb+AVB)。
+#   - workflow_dispatch 输入 boot_img_url(推荐), 或
+#   - 仓库内 base/boot.img(git-lfs)。
+# 说明: 基底 boot.img 的 ramdisk+dtb 会原样保留, 只替换内核 + 注入 LKM。
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'Base boot.img URL (v2 header, OnePlus 8 / kebab / LOS 23.2)'
+        required: false
+        type: string
+      kernel_commit:
+        description: 'Kernel commit to pin (patches are generated against this)'
+        required: false
+        type: string
+        default: '4238ee49a84b'
+      manager_ref:
+        description: 'backslashxx/KernelSU ref (branch/tag/commit) to pull latest manager'
+        required: false
+        type: string
+        default: 'master'
+  push:
+    branches: [ main, master ]
+
+env:
+  # Device
+  DEVICE: 'OnePlus 8 (instantnoodle)'
+  KERNEL_SOURCE: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250.git'
+  KERNEL_BRANCH: 'lineage-23.2'
+  KERNEL_COMMIT: ${{ inputs.kernel_commit || '4238ee49a84b' }}
+  MANAGER_SOURCE: 'https://github.com/backslashxx/KernelSU.git'
+  MANAGER_REF: ${{ inputs.manager_ref || 'master' }}
+  BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
+
+  # Toolchain
+  CLANG: clang
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  CROSS_COMPILE: aarch64-linux-gnu-
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+  JOBS: '4'
+
+jobs:
+  build-lkm:
+    name: 'Build LKM boot.img (latest manager + ReKernel + DroidSpaces)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+
+      - name: Checkout repo (patches & tools)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 libclang-18-dev \
+            gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu \
+            cpio zstd python3 bc bison flex libssl-dev
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/lib/llvm-18/lib/libclang.so.1 /usr/lib/llvm-18/lib/libclang.so
+          clang --version | head -1
+
+      - name: Setup Rust (for ksud / ksuinit)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-unknown-linux-musl
+          rustc --version
+
+      - name: Clone kernel & pin verified base
+        run: |
+          git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
+          cd device_kernel
+          git fetch --depth=1 origin "$KERNEL_COMMIT"
+          git checkout "$KERNEL_COMMIT"
+          git rev-parse HEAD
+
+      - name: Clone latest manager (backslashxx/KernelSU)
+        run: |
+          git clone --depth=1 --single-branch -b "$MANAGER_REF" "$MANAGER_SOURCE" kernelsu
+          cd kernelsu
+          echo "manager HEAD: $(git rev-parse HEAD)"
+          echo "KSU_VERSION: $(grep -oP 'KSU_VERSION=\K[0-9]+' kernel/Makefile)"
+
+      - name: Patch kernel - Re:Kernel
+        run: |
+          cd device_kernel
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch"
+          grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
+          grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
+
+      - name: Patch kernel - DroidSpaces (cgroup prefix fix)
+        run: |
+          cd device_kernel
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
+          # xt_qtaguid fix is skipped automatically if net/netfilter/xt_qtaguid.c is absent
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            echo "xt_qtaguid.c present - coccinelle patch not auto-applied, apply manually if needed"
+          else
+            echo "[-] xt_qtaguid.c absent, skipped"
+          fi
+
+      - name: Generate kernel config (defconfig + oplus + droidspaces, no LTO/CFI)
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          mkdir -p "$OUT"
+          # CC=clang MUST be a command-line make arg (Makefile overrides env CC)
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- vendor/kona-perf_defconfig
+          # merge_config.sh runs an internal make; pass CC via MAKEFLAGS
+          MAKEFLAGS="CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-" \
+            scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
+              arch/arm64/configs/vendor/oplus.config \
+              "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
+          # Force no LTO / no CFI (CFI kernel cannot load a non-CFI ksu.ko), enable ReKernel
+          ./scripts/config --file "$OUT/.config" \
+            -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
+            -e REKERNEL -d REKERNEL_NETWORK
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL" "$OUT/.config"
+
+      - name: Prepare kernel for out-of-tree module build
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" modules_prepare
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- init/version.o
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- security/selinux/avc.o
+          ls -la "$OUT/include/generated/compile.h" "$OUT/security/selinux/flask.h"
+
+      - name: Build ksuinit (aarch64, for ramdisk injection)
+        run: |
+          cd kernelsu
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          export CARGO_PROFILE_RELEASE_LTO=false
+          cargo build --package ksuinit --target=aarch64-unknown-linux-musl --release -j"$JOBS"
+          cp target/aarch64-unknown-linux-musl/release/ksuinit userspace/ksud/bin/aarch64/ksuinit
+          file userspace/ksud/bin/aarch64/ksuinit
+
+      - name: Patch ksud (allow boot header v2) and build host ksud
+        run: |
+          cd kernelsu
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/ksud-v2.patch"
+          export CARGO_PROFILE_RELEASE_LTO=false
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          cargo build --package ksud --release -j"$JOBS"
+          ./target/release/ksud --version
+
+      - name: Build ksu.ko (LKM driver against patched kernel)
+        run: |
+          cd kernelsu/kernel
+          make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
+            CONFIG_KSU=m CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$JOBS" modules
+          strings ksu.ko | grep '^vermagic'
+          ls -la ksu.ko
+
+      - name: Build kernel Image
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image
+          ls -la "$OUT/arch/arm64/boot/Image"
+          # sanity check: no CFI in the built kernel
+          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_REKERNEL" || true
+
+      - name: Obtain base boot.img (v2)
+        run: |
+          mkdir -p base_out
+          if [ -n "$BOOT_IMG_URL" ]; then
+            echo "[+] Downloading base boot.img from URL"
+            curl -fsSL "$BOOT_IMG_URL" -o base_out/boot.img
+          elif [ -f "base/boot.img" ]; then
+            echo "[+] Using repo base/boot.img"
+            cp base/boot.img base_out/boot.img
+          else
+            echo "::error::No base boot.img. Provide boot_img_url input or commit base/boot.img"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" base_out/boot.img
+
+      - name: Swap kernel + inject LKM into boot.img
+        run: |
+          mkdir -p out_img
+          python3 "$GITHUB_WORKSPACE/tools/swap_kernel.py" \
+            base_out/boot.img \
+            device_kernel/out/arch/arm64/boot/Image \
+            out_img/swapped.img
+          kernelsu/target/release/ksud boot-patch \
+            --boot out_img/swapped.img \
+            --module kernelsu/kernel/ksu.ko \
+            --arch aarch64 \
+            --out out_img/
+          ls -la out_img/
+
+      - name: Verify final boot.img
+        run: |
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" out_img/kernelsu_patched_*.img
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-patched-kernelsu-ds-rk
+          path: |
+            out_img/kernelsu_patched_*.img
+            kernelsu/kernel/ksu.ko
+          if-no-files-found: error
