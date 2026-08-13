@@ -30,8 +30,6 @@ on:
         required: false
         type: string
         default: 'master'
-  push:
-    branches: [ main, master ]
 
 env:
   # Device
@@ -74,7 +72,7 @@ jobs:
 
       - name: Setup Rust (for ksud / ksuinit)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal --default-toolchain stable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add aarch64-unknown-linux-musl
