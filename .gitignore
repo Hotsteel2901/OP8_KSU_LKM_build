@@ -5,3 +5,4 @@ out_img/
 base_out/
 *.img
 *.ko
+__pycache__/
