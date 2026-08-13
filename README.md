@@ -12,8 +12,8 @@
 
 1. Fork 本仓库,启用 Actions(`Settings → Actions → General → Workflow permissions: Read and write`)。
 2. 准备基底 boot.img(**header v2**):
-   - 推荐:Run workflow 时在 `boot_img_url` 输入框填你的 LOS boot.img 直链;或
-   - 把 `base/boot.img` 提交到仓库(Git LFS)。
+   - 仓库已内置 `base/boot.img`(LOS 23.2 kebab 官方 ramdisk+dtb),**默认直接用,`boot_img_url` 可不填**;
+   - 想用自己的基底,Run workflow 时在 `boot_img_url` 填直链即可覆盖。
    - 基底用于提供 **ramdisk + dtb + AVB footer**,内核会被替换,ramdisk 会被注入 ksud/ksu.ko。
 3. `Actions → Build Non-GKI LKM Kernel → Run workflow`。
 4. 下载产物 `boot-patched-kernelsu-ds-rk`,刷机:
@@ -27,7 +27,7 @@
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `boot_img_url` | 空 | 基底 boot.img 直链(或提交 `base/boot.img`) |
+| `boot_img_url` | 空(用仓库内置 `base/boot.img`) | 基底 boot.img 直链,覆盖默认基底 |
 | `kernel_commit` | `lineage-23.2` | **内核拉取的分支/提交,默认最新**;想锁版本填 commit SHA |
 | `patch_base` | `4238ee49a84b` | DS/RK 补丁在最新内核上打失败时的**自动回退基线** |
 | `manager_ref` | `master` | backslashxx/KernelSU 的拉取引用(默认最新 master) |
