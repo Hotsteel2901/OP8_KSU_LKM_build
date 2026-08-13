@@ -1,0 +1,219 @@
+name: Build KSUNext LKM Kernel (OnePlus 8 / LOS 23.2)
+
+# 基于 master 分支的 backslashxx 工作流,改为使用 KernelSU-Next 作为管理器。
+# 自动拉取 KernelSU-Next 最新提交,打上 ksunext-4.19-compat.patch(本仓库在 4.19 上
+# 编译 KSUNext 驱动的全部兼容修改)+ ksud-v2.patch(允许 boot header v2)。
+# 内核侧与 master 完全一致:Re:Kernel + DroidSpaces,no-LTO/CFI。
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'Base boot.img URL (v2 header, OnePlus 8 / kebab / LOS 23.2)'
+        required: false
+        type: string
+      kernel_commit:
+        description: 'Kernel ref to pull: branch or commit SHA (default: lineage-23.2 = latest)'
+        required: false
+        type: string
+        default: 'lineage-23.2'
+      patch_base:
+        description: 'Fallback kernel commit if DS/RK patches fail on latest'
+        required: false
+        type: string
+        default: '4238ee49a84b'
+
+env:
+  DEVICE: 'OnePlus 8 (instantnoodle)'
+  KERNEL_SOURCE: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250.git'
+  KERNEL_BRANCH: 'lineage-23.2'
+  KERNEL_REF: ${{ inputs.kernel_commit || 'lineage-23.2' }}
+  PATCH_BASE: ${{ inputs.patch_base || '4238ee49a84b' }}
+  MANAGER_SOURCE: 'https://github.com/KernelSU-Next/KernelSU-Next.git'
+  BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+  JOBS: '4'
+
+jobs:
+  build-ksunext-lkm:
+    name: 'Build KSUNext LKM boot.img (latest + DS + RK)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+
+      - name: Checkout repo (patches & tools)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 libclang-18-dev \
+            gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu \
+            cpio zstd python3 bc bison flex libssl-dev
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/lib/llvm-18/lib/libclang.so.1 /usr/lib/llvm-18/lib/libclang.so
+          clang --version | head -1
+
+      - name: Setup Rust (for ksud / ksuinit)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-unknown-linux-musl
+          rustc --version
+
+      - name: Clone kernel (latest by default)
+        run: |
+          git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
+          cd device_kernel
+          if git cat-file -e "$KERNEL_REF^{commit}" 2>/dev/null; then
+            git checkout -q "$KERNEL_REF"
+          else
+            git fetch -q --depth=1 origin "$KERNEL_REF"
+            git checkout -q "$KERNEL_REF"
+          fi
+          echo "kernel HEAD: $(git rev-parse HEAD)"
+
+      - name: Clone latest KSUNext
+        run: |
+          git clone --depth=1 "$MANAGER_SOURCE" ksunext
+          cd ksunext
+          echo "KSUNext HEAD: $(git rev-parse HEAD)"
+
+      - name: Patch kernel - Re:Kernel (auto-fallback to verified base)
+        run: |
+          cd device_kernel
+          apply_patches() {
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch" && \
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
+          }
+          if apply_patches; then
+            echo "[+] DS/RK patches applied on $(git rev-parse HEAD) (latest)"
+          else
+            echo "[!] patches failed on latest, resetting and falling back to verified base $PATCH_BASE"
+            git checkout -f -q . ; git clean -fd -q ; git reset -q --hard
+            git fetch -q --depth=1 origin "$PATCH_BASE"
+            git checkout -q "$PATCH_BASE"
+            apply_patches || { echo "::error::patches also failed on $PATCH_BASE"; exit 1; }
+            echo "[+] DS/RK patches applied on $PATCH_BASE (verified base)"
+          fi
+          grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
+          grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
+
+      - name: DroidSpaces xt_qtaguid check (cgroup fix already applied above)
+        run: |
+          cd device_kernel
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            echo "xt_qtaguid.c present - coccinelle patch not auto-applied, apply manually if needed"
+          else
+            echo "[-] xt_qtaguid.c absent, skipped"
+          fi
+
+      - name: Patch KSUNext - 4.19 compat + ksud v2 support
+        run: |
+          cd ksunext
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/ksunext-4.19-compat.patch"
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/ksud-v2.patch"
+
+      - name: Generate kernel config (defconfig + oplus + droidspaces, no LTO/CFI)
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          mkdir -p "$OUT"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- vendor/kona-perf_defconfig
+          MAKEFLAGS="CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-" \
+            scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
+              arch/arm64/configs/vendor/oplus.config \
+              "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
+          ./scripts/config --file "$OUT/.config" \
+            -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
+            -e REKERNEL -d REKERNEL_NETWORK
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL" "$OUT/.config"
+
+      - name: Prepare kernel for out-of-tree module build
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" modules_prepare
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- init/version.o
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- security/selinux/avc.o
+
+      - name: Build ksuinit (aarch64, for ramdisk injection)
+        run: |
+          cd ksunext/userspace/ksuinit
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          export CARGO_PROFILE_RELEASE_LTO=false
+          cargo build --target=aarch64-unknown-linux-musl --release -j"$JOBS"
+          mkdir -p ../ksud/bin/aarch64
+          cp target/aarch64-unknown-linux-musl/release/ksuinit ../ksud/bin/aarch64/ksuinit
+          file ../ksud/bin/aarch64/ksuinit
+
+      - name: Build host ksud
+        run: |
+          cd ksunext/userspace/ksud
+          export CARGO_PROFILE_RELEASE_LTO=false
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          cargo build --release -j"$JOBS"
+          ./target/release/ksud --version
+
+      - name: Build kernelsu.ko (KSUNext LKM driver against patched kernel)
+        run: |
+          cd ksunext/kernel
+          make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
+            CONFIG_KSU=m CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$JOBS" modules
+          strings kernelsu.ko | grep '^vermagic'
+          ls -la kernelsu.ko
+
+      - name: Build kernel Image
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image
+          ls -la "$OUT/arch/arm64/boot/Image"
+
+      - name: Obtain base boot.img (v2)
+        run: |
+          mkdir -p base_out
+          if [ -n "$BOOT_IMG_URL" ]; then
+            echo "[+] Downloading base boot.img from URL"
+            curl -fsSL "$BOOT_IMG_URL" -o base_out/boot.img
+          elif [ -f "base/boot.img" ]; then
+            echo "[+] Using repo base/boot.img"
+            cp base/boot.img base_out/boot.img
+          else
+            echo "::error::No base boot.img. Provide boot_img_url input or commit base/boot.img"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" base_out/boot.img
+
+      - name: Swap kernel + inject LKM into boot.img
+        run: |
+          mkdir -p out_img
+          python3 "$GITHUB_WORKSPACE/tools/swap_kernel.py" \
+            base_out/boot.img \
+            device_kernel/out/arch/arm64/boot/Image \
+            out_img/swapped.img
+          # KSUNext has no --module shortcut: pass an explicit --kmi to skip KMI autodetect
+          ksunext/userspace/ksud/target/release/ksud boot-patch \
+            --boot out_img/swapped.img \
+            --module ksunext/kernel/kernelsu.ko \
+            --kmi ksunext \
+            --arch aarch64 \
+            --out out_img/
+          ls -la out_img/
+
+      - name: Verify final boot.img
+        run: |
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" out_img/kernelsu_next_patched_*.img
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-patched-ksunext-ds-rk
+          path: |
+            out_img/kernelsu_next_patched_*.img
+            ksunext/kernel/kernelsu.ko
+          if-no-files-found: error
