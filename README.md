@@ -23,6 +23,17 @@
    ```
 5. 开机后安装 backslashxx 管理器 APK(**release 版即可**,签名与 ksu.ko 内置校验一致)。
 
+### 输入参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `boot_img_url` | 空 | 基底 boot.img 直链(或提交 `base/boot.img`) |
+| `kernel_commit` | `lineage-23.2` | **内核拉取的分支/提交,默认最新**;想锁版本填 commit SHA |
+| `patch_base` | `4238ee49a84b` | DS/RK 补丁在最新内核上打失败时的**自动回退基线** |
+| `manager_ref` | `master` | backslashxx/KernelSU 的拉取引用(默认最新 master) |
+
+> **内核"最新"策略**:默认拉 `lineage-23.2` 最新提交。由于 DS/RK 补丁按 `4238ee49a84b` 生成,若最新提交改动过大导致补丁打不上,工作流会**自动回退到 `patch_base`**(已验证基线)再打。两种情况下产物都可用。
+
 ## 产物
 
 | 文件 | 说明 |
@@ -92,6 +103,6 @@ Patches/
 
 ## 维护
 
-- 内核补丁基于 commit `4238ee49a84b`。LOS 上游若移动,先核对基线再重打补丁。
-- 管理器侧每次运行都拉最新 master,`ksu.ko`/`ksud`/`ksuinit` 自动跟随。
+- 内核默认拉最新;DS/RK 补丁基于 `4238ee49a84b` 生成,若最新内核补丁打不上会自动回退到 `patch_base`。长期想跟进最新,可在最新提交上重打补丁并提交更新 `Patches/Rekernel/` 与 `Patches/Droidspaces/cgroup.patch`。
+- 管理器侧每次运行都拉最新 master,`ksu.ko`/`ksud`/`ksuinit` 自动跟随。若 manager 源码改了 `boot_patch.rs` 导致 `Patches/ksud-v2.patch` 打不上,工作流会失败,需同步更新该补丁。
 - 想集成更多模块,在 `build-lkm.yml` 的 config/补丁步骤后追加即可。

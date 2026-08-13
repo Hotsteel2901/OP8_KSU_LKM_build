@@ -16,7 +16,12 @@ on:
         required: false
         type: string
       kernel_commit:
-        description: 'Kernel commit to pin (patches are generated against this)'
+        description: 'Kernel ref to pull: branch or commit SHA (default: lineage-23.2 = latest)'
+        required: false
+        type: string
+        default: 'lineage-23.2'
+      patch_base:
+        description: 'Fallback kernel commit if DS/RK patches fail on latest'
         required: false
         type: string
         default: '4238ee49a84b'
@@ -33,7 +38,8 @@ env:
   DEVICE: 'OnePlus 8 (instantnoodle)'
   KERNEL_SOURCE: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250.git'
   KERNEL_BRANCH: 'lineage-23.2'
-  KERNEL_COMMIT: ${{ inputs.kernel_commit || '4238ee49a84b' }}
+  KERNEL_REF: ${{ inputs.kernel_commit || 'lineage-23.2' }}
+  PATCH_BASE: ${{ inputs.patch_base || '4238ee49a84b' }}
   MANAGER_SOURCE: 'https://github.com/backslashxx/KernelSU.git'
   MANAGER_REF: ${{ inputs.manager_ref || 'master' }}
   BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
@@ -74,13 +80,17 @@ jobs:
           rustup target add aarch64-unknown-linux-musl
           rustc --version
 
-      - name: Clone kernel & pin verified base
+      - name: Clone kernel (latest by default)
         run: |
           git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
           cd device_kernel
-          git fetch --depth=1 origin "$KERNEL_COMMIT"
-          git checkout "$KERNEL_COMMIT"
-          git rev-parse HEAD
+          if git cat-file -e "$KERNEL_REF^{commit}" 2>/dev/null; then
+            git checkout -q "$KERNEL_REF"
+          else
+            git fetch -q --depth=1 origin "$KERNEL_REF"
+            git checkout -q "$KERNEL_REF"
+          fi
+          echo "kernel HEAD: $(git rev-parse HEAD)"
 
       - name: Clone latest manager (backslashxx/KernelSU)
         run: |
@@ -89,10 +99,23 @@ jobs:
           echo "manager HEAD: $(git rev-parse HEAD)"
           echo "KSU_VERSION: $(grep -oP 'KSU_VERSION=\K[0-9]+' kernel/Makefile)"
 
-      - name: Patch kernel - Re:Kernel
+      - name: Patch kernel - Re:Kernel (auto-fallback to verified base)
         run: |
           cd device_kernel
-          patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch"
+          apply_patches() {
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch" && \
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
+          }
+          if apply_patches; then
+            echo "[+] DS/RK patches applied on $(git rev-parse HEAD) (latest)"
+          else
+            echo "[!] patches failed on latest, resetting and falling back to verified base $PATCH_BASE"
+            git checkout -f -q . ; git clean -fd -q ; git reset -q --hard
+            git fetch -q --depth=1 origin "$PATCH_BASE"
+            git checkout -q "$PATCH_BASE"
+            apply_patches || { echo "::error::patches also failed on $PATCH_BASE"; exit 1; }
+            echo "[+] DS/RK patches applied on $PATCH_BASE (verified base)"
+          fi
           grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
           grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
 
