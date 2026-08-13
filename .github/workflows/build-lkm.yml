@@ -117,11 +117,9 @@ jobs:
           grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
           grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
 
-      - name: Patch kernel - DroidSpaces (cgroup prefix fix)
+      - name: DroidSpaces xt_qtaguid check (cgroup fix already applied above)
         run: |
           cd device_kernel
-          patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
-          # xt_qtaguid fix is skipped automatically if net/netfilter/xt_qtaguid.c is absent
           if [ -f net/netfilter/xt_qtaguid.c ]; then
             echo "xt_qtaguid.c present - coccinelle patch not auto-applied, apply manually if needed"
           else
