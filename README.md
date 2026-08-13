@@ -107,19 +107,13 @@ Patches/
 - 管理器侧每次运行都拉最新 master,`ksu.ko`/`ksud`/`ksuinit` 自动跟随。若 manager 源码改了 `boot_patch.rs` 导致 `Patches/ksud-v2.patch` 打不上,工作流会失败,需同步更新该补丁。
 - 想集成更多模块,在 `build-lkm.yml` 的 config/补丁步骤后追加即可。
 
-## 感谢 / Credits
+## 致谢
 
-这个项目能成立,离不开以下项目与作者的无私分享:
-
-| 项目 | 作者 | 用途 |
-|---|---|---|
-| [NonGKI_Kernel_Build_OP8](https://github.com/Hotsteel2901/NonGKI_Kernel_Build_OP8) | **Hotsteel2901** | 内核补丁(ReKernel / DroidSpaces)、构建思路与排障记录的直接来源 |
-| [NonGKI_Kernel_Build_2nd](https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd) | JackA1ltman | 非 GKI 内核构建工作流模板 |
-| [KernelSU](https://github.com/backslashxx/KernelSU) | backslashxx | 支持 4.19/5.4 的 LKM 版 KernelSU(管理器 + 内核驱动 + ksud) |
-| [Re-Kernel](https://github.com/Sakion-Team/Re-Kernel) | Sakion-Team | Re:Kernel(binder 冻结优化等) |
-| [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS) | ravindu644 | DroidSpaces 配置与 cgroup 修复 |
-| [ReSukiSU](https://github.com/ReSukiSU/ReSukiSU) | ReSukiSU | 4.19 补丁适配参考 |
-| [SuSFS](https://gitlab.com/simonpunk/susfs4ksu) | simonpunk | 4.19 适配参考 |
-| [Baseband-guard](https://github.com/vc-teahouse/Baseband-guard) | vc-teahouse | 分区写保护 LSM 参考 |
-
-同时感谢所有在 LKM 模式 / 非 GKI 内核上踩坑并公开分享经验的前辈们。
+- [Hotsteel2901/NonGKI_Kernel_Build_OP8](https://github.com/Hotsteel2901/NonGKI_Kernel_Build_OP8) - 内核补丁与排障基础
+- [JackA1ltman/NonGKI_Kernel_Build_2nd](https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd) - 工作流参考
+- [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU)
+- [Re-Kernel](https://github.com/Sakion-Team/Re-Kernel)
+- [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS)
+- [ReSukiSU](https://github.com/ReSukiSU/ReSukiSU)
+- [SuSFS](https://gitlab.com/simonpunk/susfs4ksu)
+- [Baseband-guard](https://github.com/vc-teahouse/Baseband-guard)
