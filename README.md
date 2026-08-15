@@ -49,9 +49,9 @@
 | **Re:Kernel** | `Patches/Rekernel/rekernel_extra.patch` + `CONFIG_REKERNEL=y`,`CONFIG_REKERNEL_NETWORK=n` |
 | **DroidSpaces** | `Patches/Droidspaces/cgroup.patch`(cgroup 前缀隐藏)+ `droidspaces.config` 全量配置片段 |
 
-## 关键经验(踩过的坑)
+## 坑
 
-### 1. 为什么必须关 LTO/CFI
+### 1. 必须关 LTO/CFI
 `kona-perf_defconfig` 里有 `CONFIG_LTO_CLANG=y` / `CONFIG_CFI_CLANG=y`。**官方 LOS 构建用 `LD=ld.lld`(`LLVM=1`)→ CFI 生效**,而普通方式编出的非 CFI `ksu.ko` 在 CFI 内核上**第一次间接调用就 panic**。本工作流强制:
 ```
 scripts/config --file out/.config -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW
@@ -84,10 +84,7 @@ make security/selinux/avc.o   # 生成 security/selinux/flask.h
 ```
 `flask.h` 缺失会直接报 `fatal error: 'flask.h' file not found`。
 
-### 7. 构建内存
-4.19 全量编译吃内存,`-j4` 在 GitHub runner(16G)足够;本地 7G 机器建议 `-j2`。
-
-## Patches 目录
+## Patches
 
 ```
 Patches/
