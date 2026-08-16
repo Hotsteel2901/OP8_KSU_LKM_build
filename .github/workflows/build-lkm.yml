@@ -116,6 +116,10 @@ jobs:
           fi
           grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
           grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
+          # Customize localversion: replace the auto "-g<hash>-dirty" suffix
+          # with "-g<hash>-hotsteel-LKM" (no more -dirty)
+          echo "-g$(git rev-parse --short HEAD)-hotsteel-LKM" > .scmversion
+          echo "[+] scmversion: $(cat .scmversion)"
 
       - name: DroidSpaces xt_qtaguid check (cgroup fix already applied above)
         run: |
