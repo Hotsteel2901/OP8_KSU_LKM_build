@@ -4,8 +4,6 @@
 
 自动拉取 [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU) **最新 master 提交**,集成 **LKM(kernelsu.ko + ksud)** + **Re:Kernel** + **DroidSpaces**,产出可 `fastboot` 直刷的 **boot.img(header v2)**。
 
-与 [NonGKI_Kernel_Build_OP8](https://github.com/Hotsteel2901/NonGKI_Kernel_Build_OP8) 的区别:那个是 **ReSukiSU 内建(in-tree)模式** + AnyKernel3;这里是 **纯 LKM 模式**(KernelSU 代码 100% 在 `kernelsu.ko`,运行时加载),且只集成 DS+RK,**不集成** SUSFS / ReSukiSU / Baseband-guard。
-
 ---
 
 ## 使用
