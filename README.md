@@ -2,7 +2,7 @@
 
 **OnePlus 8 (instantnoodle / sm8250 / kona) · LineageOS 23.2 (4.19.325) · KernelSU LKM 模式**
 
-自动拉取 [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU) **最新 master 提交**,集成 **LKM(kernelsu.ko + ksud)** + **Re:Kernel** + **DroidSpaces**,产出可 `fastboot` 直刷的 **boot.img(header v2)**。
+自动拉取 [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU) **最新 master 提交**,集成 **LKM(kernelsu.ko + ksud)** + **ReKernel-X** + **DroidSpaces**,产出可 `fastboot` 直刷的 **boot.img(header v2)**。
 
 ---
 
@@ -27,10 +27,10 @@
 |---|---|---|
 | `boot_img_url` | 空(用仓库内置 `base/boot.img`) | 基底 boot.img 直链,覆盖默认基底 |
 | `kernel_commit` | `lineage-23.2` | **内核拉取的分支/提交,默认最新**;想锁版本填 commit SHA |
-| `patch_base` | `4238ee49a84b` | DS/RK 补丁在最新内核上打失败时的**自动回退基线** |
+| `patch_base` | `4238ee49a84b` | DS/RKX 补丁在最新内核上打失败时的**自动回退基线** |
 | `manager_ref` | `master` | backslashxx/KernelSU 的拉取引用(默认最新 master) |
 
-> **内核"最新"策略**:默认拉 `lineage-23.2` 最新提交。由于 DS/RK 补丁按 `4238ee49a84b` 生成,若最新提交改动过大导致补丁打不上,工作流会**自动回退到 `patch_base`**(已验证基线)再打。两种情况下产物都可用。
+> **内核"最新"策略**:默认拉 `lineage-23.2` 最新提交。`rkx-4.19.patch` 已在最新提交与已验证基线 `4238ee49a84b`(两者相关文件一致)上验证可打;若最新提交改动过大导致补丁打不上,工作流会**自动回退到 `patch_base`**(已验证基线)再打。两种情况下产物都可用。
 
 ## 产物
 
@@ -44,7 +44,7 @@
 | 组件 | 说明 |
 |---|---|
 | **KernelSU LKM** | `backslashxx/KernelSU` 最新 master;`ksu.ko` 外置编译,`ksud` 被打了 v2 补丁(原版只认 v3+ 头) |
-| **Re:Kernel** | `Patches/Rekernel/rekernel_extra.patch` + `CONFIG_REKERNEL=y`,`CONFIG_REKERNEL_NETWORK=n` |
+| **ReKernel-X** | `Patches/RekernelX/rkx-4.19.patch`(内置驱动:genl 家族 `rekernel_x2` + binder/signal/netfilter 事件)+ `CONFIG_REKERNEL_X=y` |
 | **DroidSpaces** | `Patches/Droidspaces/cgroup.patch`(cgroup 前缀隐藏)+ `droidspaces.config` 全量配置片段 |
 
 ## 坑
@@ -87,8 +87,8 @@ make security/selinux/avc.o   # 生成 security/selinux/flask.h
 ```
 Patches/
 ├── ksud-v2.patch                    # ksud boot-patch 支持 v2 头
-├── Rekernel/
-│   └── rekernel_extra.patch         # Re:Kernel 源码(驱动 + binder + signal)
+├── RekernelX/
+│   └── rkx-4.19.patch               # ReKernel-X 内置驱动(genl + binder + signal + netfilter)
 └── Droidspaces/
     ├── cgroup.patch                 # cgroup 前缀隐藏(kernfs_create_link)
     ├── droidspaces.config           # DroidSpaces 内核配置片段
@@ -98,7 +98,7 @@ Patches/
 
 ## 维护
 
-- 内核默认拉最新;DS/RK 补丁基于 `4238ee49a84b` 生成,若最新内核补丁打不上会自动回退到 `patch_base`。长期想跟进最新,可在最新提交上重打补丁并提交更新 `Patches/Rekernel/` 与 `Patches/Droidspaces/cgroup.patch`。
+- 内核默认拉最新;DS/RKX 补丁基于 `lineage-23.2` 最新(与已验证基线 `4238ee49a84b` 相关文件一致)生成,若最新内核补丁打不上会自动回退到 `patch_base`。长期想跟进最新,可在最新提交上重打补丁并提交更新 `Patches/RekernelX/rkx-4.19.patch` 与 `Patches/Droidspaces/cgroup.patch`。
 - 管理器侧每次运行都拉最新 master,`ksu.ko`/`ksud`/`ksuinit` 自动跟随。若 manager 源码改了 `boot_patch.rs` 导致 `Patches/ksud-v2.patch` 打不上,工作流会失败,需同步更新该补丁。
 - 想集成更多模块,在 `build-lkm.yml` 的 config/补丁步骤后追加即可。
 

@@ -1,7 +1,7 @@
 name: Build Non-GKI LKM Kernel (OnePlus 8 / LOS 23.2)
 
 # 自动拉取 backslashxx/KernelSU 最新 master 提交,集成 LKM(kernelsu.ko + ksud)
-# + Re:Kernel + DroidSpaces,产出可 fastboot 直刷的 boot.img(v2 header)。
+# + ReKernel-X + DroidSpaces,产出可 fastboot 直刷的 boot.img(v2 header)。
 #
 # 前置: 需要一个 v2 boot.img 作为基底(提供内核 Image/DTB 之外的 ramdisk+dtb+AVB)。
 #   - workflow_dispatch 输入 boot_img_url(推荐), 或
@@ -51,7 +51,7 @@ env:
 
 jobs:
   build-lkm:
-    name: 'Build LKM boot.img (latest manager + ReKernel + DroidSpaces)'
+    name: 'Build LKM boot.img (latest manager + ReKernel-X + DroidSpaces)'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -97,25 +97,24 @@ jobs:
           echo "manager HEAD: $(git rev-parse HEAD)"
           echo "KSU_VERSION: $(grep -oP 'KSU_VERSION=\K[0-9]+' kernel/Makefile)"
 
-      - name: Patch kernel - Re:Kernel (auto-fallback to verified base)
+      - name: Patch kernel - ReKernel-X (auto-fallback to verified base)
         run: |
           cd device_kernel
           apply_patches() {
-            patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch" && \
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/RekernelX/rkx-4.19.patch" && \
             patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
           }
           if apply_patches; then
-            echo "[+] DS/RK patches applied on $(git rev-parse HEAD) (latest)"
+            echo "[+] DS/RKX patches applied on $(git rev-parse HEAD) (latest)"
           else
             echo "[!] patches failed on latest, resetting and falling back to verified base $PATCH_BASE"
             git checkout -f -q . ; git clean -fd -q ; git reset -q --hard
             git fetch -q --depth=1 origin "$PATCH_BASE"
             git checkout -q "$PATCH_BASE"
             apply_patches || { echo "::error::patches also failed on $PATCH_BASE"; exit 1; }
-            echo "[+] DS/RK patches applied on $PATCH_BASE (verified base)"
+            echo "[+] DS/RKX patches applied on $PATCH_BASE (verified base)"
           fi
-          grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
-          grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
+          # rkx-4.19.patch 自带 drivers/Makefile + drivers/Kconfig 接线(不再需要手动 grep/sed)
           # Customize localversion: replace the auto "-g<hash>-dirty" suffix
           # with "-g<hash>-hotsteel-LKM" (no more -dirty)
           echo "-g$(git rev-parse --short HEAD)-hotsteel-LKM" > .scmversion
@@ -142,12 +141,12 @@ jobs:
             scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
               arch/arm64/configs/vendor/oplus.config \
               "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
-          # Force no LTO / no CFI (CFI kernel cannot load a non-CFI ksu.ko), enable ReKernel
+          # Force no LTO / no CFI (CFI kernel cannot load a non-CFI ksu.ko), enable ReKernel-X
           ./scripts/config --file "$OUT/.config" \
             -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
-            -e REKERNEL -d REKERNEL_NETWORK
+            -e REKERNEL_X -d REKERNEL -d REKERNEL_NETWORK
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL" "$OUT/.config"
+          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL|^CONFIG_REKERNEL_X" "$OUT/.config"
 
       - name: Prepare kernel for out-of-tree module build
         run: |
