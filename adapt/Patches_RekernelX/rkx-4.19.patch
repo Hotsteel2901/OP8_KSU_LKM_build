@@ -1,0 +1,1643 @@
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index e0866eda8..534be8746 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -232,4 +232,6 @@ source "drivers/sensors/Kconfig"
+ source "drivers/gpu/msm/Kconfig"
+ 
+ source "drivers/energy_model/Kconfig"
++
++source "drivers/rekernel_x/Kconfig"
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 9a258f18e..a4480efff 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -182,6 +182,8 @@ obj-$(CONFIG_CORESIGHT)		+= hwtracing/coresight/
+ obj-y				+= hwtracing/intel_th/
+ obj-$(CONFIG_STM)		+= hwtracing/stm/
+ obj-$(CONFIG_ANDROID)		+= android/
++
++obj-$(CONFIG_REKERNEL_X)	+= rekernel_x/
+ obj-$(CONFIG_NVMEM)		+= nvmem/
+ obj-$(CONFIG_FPGA)		+= fpga/
+ obj-$(CONFIG_FSI)		+= fsi/
+diff --git a/drivers/android/binder.c b/drivers/android/binder.c
+index 1eb251a3c..8a07e2b83 100644
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@ -83,6 +83,9 @@
+ #include "binder_internal.h"
+ #include "binder_trace.h"
+ #include "dbitmap.h"
++#ifdef CONFIG_REKERNEL_X
++#include <../rekernel_x/rkx.h>
++#endif /* CONFIG_REKERNEL_X */
+ 
+ static HLIST_HEAD(binder_deferred_list);
+ static DEFINE_MUTEX(binder_deferred_lock);
+@@ -2947,6 +2950,109 @@ static int binder_fixup_parent(struct binder_transaction *t,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_REKERNEL_X
++static bool binder_buffer_data_equal(struct binder_proc *proc,
++	struct binder_buffer *b1, struct binder_buffer *b2)
++{
++	size_t pos, chunk, total;
++	u8 c1[64];
++	u8 c2[64];
++
++	if (!proc || !b1 || !b2)
++		return false;
++	if (b1->data_size != b2->data_size)
++		return false;
++
++	total = b1->data_size;
++	pos = 0;
++	while (pos < total) {
++		chunk = total - pos;
++		if (chunk > sizeof(c1))
++			chunk = sizeof(c1);
++		binder_alloc_copy_from_buffer(&proc->alloc, c1, b1, pos, chunk);
++		binder_alloc_copy_from_buffer(&proc->alloc, c2, b2, pos, chunk);
++		if (memcmp(c1, c2, chunk))
++			return false;
++		pos += chunk;
++	}
++	return true;
++}
++
++static bool rkx_parse_interface_token(struct binder_proc *proc,
++	struct binder_buffer *buffer, char *rpc_name, size_t rpc_name_size)
++{
++	u8 hdr[INTERFACETOKEN_BUFF_SIZE];
++	size_t copy_size;
++	size_t i = 0, j;
++	char *p;
++
++	if (!proc || !buffer || !rpc_name || rpc_name_size == 0)
++		return false;
++
++	rpc_name[0] = '\0';
++	if (buffer->data_size <= PARCEL_OFFSET)
++		return false;
++
++	copy_size = buffer->data_size;
++	if (copy_size > sizeof(hdr))
++		copy_size = sizeof(hdr);
++
++	binder_alloc_copy_from_buffer(&proc->alloc, hdr, buffer, 0, copy_size);
++
++	p = (char *)hdr + PARCEL_OFFSET;
++	j = PARCEL_OFFSET + 1;
++	while (i + 1 < rpc_name_size && j < copy_size && *p != '\0') {
++		rpc_name[i++] = *p;
++		j += 2;
++		p += 2;
++	}
++	rpc_name[i] = '\0';
++	return i > 0;
++}
++
++static bool binder_can_update_transaction(struct binder_transaction *t1,
++					  struct binder_transaction *t2,
++					  u8 strategy)
++{
++	if ((t1->flags & t2->flags & TF_ONE_WAY) != TF_ONE_WAY ||
++	    !t1->to_proc || !t2->to_proc)
++		return false;
++	if (t1->to_proc->tsk == t2->to_proc->tsk && t1->code == t2->code &&
++	    t1->flags == t2->flags && t1->buffer->pid == t2->buffer->pid &&
++	    t1->buffer->target_node->ptr == t2->buffer->target_node->ptr &&
++	    t1->buffer->target_node->cookie == t2->buffer->target_node->cookie) {
++		if (t1->buffer->offsets_size != 0 || t2->buffer->offsets_size != 0)
++			return false;
++		if (strategy == RKX_FREE_ASYNC_BY_CODE)
++			return true;
++		if (strategy == RKX_FREE_ASYNC_BY_DATA)
++			return binder_buffer_data_equal(t1->to_proc,
++						       t1->buffer,
++						       t2->buffer);
++	}
++	return false;
++}
++
++static struct binder_transaction *
++binder_find_outdated_transaction_ilocked(struct binder_transaction *t,
++					 struct list_head *target_list,
++					 u8 strategy)
++{
++	struct binder_work *w;
++
++	list_for_each_entry(w, target_list, entry) {
++		struct binder_transaction *t_queued;
++
++		if (w->type != BINDER_WORK_TRANSACTION)
++			continue;
++		t_queued = container_of(w, struct binder_transaction, work);
++		if (binder_can_update_transaction(t_queued, t, strategy))
++			return t_queued;
++	}
++	return NULL;
++}
++#endif /* CONFIG_REKERNEL_X */
++
+ /**
+  * binder_proc_transaction() - sends a transaction to a process and wakes it up
+  * @t:		transaction to send
+@@ -2973,6 +3079,9 @@ static int binder_proc_transaction(struct binder_transaction *t,
+ 	struct binder_priority node_prio;
+ 	bool oneway = !!(t->flags & TF_ONE_WAY);
+ 	bool pending_async = false;
++#ifdef CONFIG_REKERNEL_X
++	struct binder_transaction *t_outdated = NULL;
++#endif /* CONFIG_REKERNEL_X */
+ 
+ 	BUG_ON(!node);
+ 	binder_node_lock(node);
+@@ -3011,6 +3120,26 @@ static int binder_proc_transaction(struct binder_transaction *t,
+ 	} else if (!pending_async) {
+ 		binder_enqueue_work_ilocked(&t->work, &proc->todo);
+ 	} else {
++#ifdef CONFIG_REKERNEL_X
++		if (proc->is_frozen) {
++			char rpc_name[INTERFACETOKEN_BUFF_SIZE] = {0};
++			u8 strategy = RKX_FREE_ASYNC_BY_CODE;
++
++			if (free_async_has_entries() &&
++			    rkx_parse_interface_token(proc, t->buffer,
++						      rpc_name,
++						      sizeof(rpc_name)))
++				free_async_lookup_rcu(rpc_name, t->code,
++						      &strategy);
++			if (strategy != RKX_FREE_ASYNC_SKIP)
++				t_outdated = binder_find_outdated_transaction_ilocked(
++						t, &node->async_todo, strategy);
++			if (t_outdated) {
++				list_del_init(&t_outdated->work.entry);
++				proc->outstanding_txns--;
++			}
++		}
++#endif /* CONFIG_REKERNEL_X */
+ 		binder_enqueue_work_ilocked(&t->work, &node->async_todo);
+ 	}
+ 
+@@ -3021,6 +3150,19 @@ static int binder_proc_transaction(struct binder_transaction *t,
+ 	binder_inner_proc_unlock(proc);
+ 	binder_node_unlock(node);
+ 
++#ifdef CONFIG_REKERNEL_X
++	if (t_outdated) {
++		struct binder_buffer *buffer = t_outdated->buffer;
++
++		t_outdated->buffer = NULL;
++		buffer->transaction = NULL;
++		binder_transaction_buffer_release(proc, buffer, 0, false);
++		binder_alloc_free_buf(&proc->alloc, buffer);
++		kfree(t_outdated);
++		binder_stats_deleted(BINDER_STAT_TRANSACTION);
++	}
++#endif /* CONFIG_REKERNEL_X */
++
+ 	return 0;
+ }
+ 
+@@ -3364,6 +3506,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 
+ 	trace_binder_transaction(reply, t, target_node);
+ 
++#ifdef CONFIG_REKERNEL_X
++	rkx_binder_report(reply, target_proc->tsk, proc->tsk, tr);
++#endif /* CONFIG_REKERNEL_X */
++
+ 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
+ 		tr->offsets_size, extra_buffers_size,
+ 		!reply && (t->flags & TF_ONE_WAY), current->tgid);
+diff --git a/drivers/android/binder_alloc.c b/drivers/android/binder_alloc.c
+index e0183282f..c8ae9d204 100644
+--- a/drivers/android/binder_alloc.c
++++ b/drivers/android/binder_alloc.c
+@@ -33,6 +33,9 @@
+ #include <linux/highmem.h>
+ #include "binder_alloc.h"
+ #include "binder_trace.h"
++#ifdef CONFIG_REKERNEL_X
++#include <../rekernel_x/rkx.h>
++#endif /* CONFIG_REKERNEL_X */
+ 
+ struct list_lru binder_alloc_lru;
+ 
+@@ -434,6 +437,11 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
+ 	/* Pad 0-size buffers so they get assigned unique addresses */
+ 	size = max(size, sizeof(void *));
+ 
++#ifdef CONFIG_REKERNEL_X
++	if (is_async)
++		rkx_binder_free_async_warn(alloc->pid, size,
++					   alloc->free_async_space);
++#endif
+ 	if (is_async && alloc->free_async_space < size) {
+ 		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+ 			     "%d: binder_alloc_buf size %zd failed, no async space left\n",
+diff --git a/drivers/rekernel_x/Kconfig b/drivers/rekernel_x/Kconfig
+new file mode 100644
+index 000000000..62a54be2c
+--- /dev/null
++++ b/drivers/rekernel_x/Kconfig
+@@ -0,0 +1,10 @@
++menu "ReKernel-X"
++
++config REKERNEL_X
++	bool "ReKernel-X support"
++	default y
++	help
++	  Frozen-process Binder / Signal / Network monitoring.
++	  Sends events to userspace via Generic Netlink family "rekernel_x2".
++	  Ported from ReKernel-X (myflavor / Sakion Team) to non-GKI 4.19.
++endmenu
+diff --git a/drivers/rekernel_x/Makefile b/drivers/rekernel_x/Makefile
+new file mode 100644
+index 000000000..f655df542
+--- /dev/null
++++ b/drivers/rekernel_x/Makefile
+@@ -0,0 +1,8 @@
++obj-$(CONFIG_REKERNEL_X) += rekernel_x.o
++
++rekernel_x-y := rkx.o rkx_genl.o rkx_netuid.o rkx_free_async.o \
++		rkx_frozen.o rkx_netfilter.o rkx_binder.o rkx_signal.o
++
++ifdef RKX_VERSION
++ccflags-y += -DRKX_VERSION=\"$(RKX_VERSION)\"
++endif
+diff --git a/drivers/rekernel_x/rkx.c b/drivers/rekernel_x/rkx.c
+new file mode 100644
+index 000000000..af246f991
+--- /dev/null
++++ b/drivers/rekernel_x/rkx.c
+@@ -0,0 +1,64 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx.c — Module entry (init/exit) & hooks wiring.
++ * Ported to non-GKI 4.19: binder/signal events are delivered by the
++ * patched kernel sources (drivers/android/binder.c, binder_alloc.c,
++ * kernel/signal.c) calling rkx_*_report(); this file only owns the
++ * Generic Netlink transport, netfilter and the rule hashmaps.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/init.h>
++
++static int __init start_rekernel(void)
++{
++	rkx_log_info("starting...\n");
++	rkx_log_info("Version %s | by myflavor, Sakion Team\n", RKX_VERSION);
++
++	init_net_uid();
++	init_free_async();
++
++	if (register_genl() != LINE_SUCCESS)
++	{
++		rkx_log_err("%s: Failed to register genl family!\n", __func__);
++		goto err;
++	}
++
++	rkx_log_info("start hooking!\n");
++
++	if (register_netfilter() != LINE_SUCCESS)
++	{
++		rkx_log_err("%s: Failed to hook netfilter!\n", __func__);
++		goto err;
++	}
++
++	rkx_log_info("hooked!\n");
++	return LINE_SUCCESS;
++
++err:
++	unregister_netfilter();
++	unregister_genl();
++	destroy_free_async();
++	destroy_net_uid();
++	return LINE_ERROR;
++}
++
++static void __exit exit_rekernel(void)
++{
++	rkx_log_info("closing...\n");
++	unregister_netfilter();
++	unregister_genl();
++	destroy_free_async();
++	destroy_net_uid();
++}
++
++module_init(start_rekernel);
++module_exit(exit_rekernel);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("myflavor <admin@myflv.cn>");
++MODULE_DESCRIPTION("ReKernel-X: frozen-process binder/signal/network monitor (4.19 port)");
+diff --git a/drivers/rekernel_x/rkx.h b/drivers/rekernel_x/rkx.h
+new file mode 100644
+index 000000000..a54b2fb94
+--- /dev/null
++++ b/drivers/rekernel_x/rkx.h
+@@ -0,0 +1,197 @@
++#ifndef RKX_H
++#define RKX_H
++
++#include <linux/types.h>
++#include <linux/uidgid.h>
++
++struct task_struct;
++struct binder_transaction_data;
++
++#ifndef RKX_VERSION
++#define RKX_VERSION "dev"
++#endif
++
++#define MIN_USERAPP_UID (10000)
++#define MAX_SYSTEM_UID (2000)
++#define SYSTEM_APP_UID (1000)
++#define RESERVE_ORDER 17
++#define WARN_AHEAD_SPACE (1 << RESERVE_ORDER)
++#define INTERFACETOKEN_BUFF_SIZE (140)
++#define PARCEL_OFFSET (16) /* sync with the writeInterfaceToken */
++#define LINE_ERROR (-1)
++#define LINE_SUCCESS (0)
++
++#define RKX_GENL_FAMILY_NAME "rekernel_x2"
++#define RKX_GENL_VERSION 1
++#define RKX_GENL_MCGRP_NAME "events"
++
++// netlink cmd
++enum rkx_genl_cmd
++{
++	RKX_C_UNSPEC,
++	RKX_C_EVENT,			  // kernel -> user
++	RKX_C_ADD_MONITOR_NET, // user -> kernel
++	RKX_C_DEL_MONITOR_NET, // user -> kernel
++	RKX_C_ADD_FREE_ASYNC,  // user -> kernel
++	RKX_C_DEL_FREE_ASYNC,  // user -> kernel
++	__RKX_C_MAX,
++};
++#define RKX_C_MAX (__RKX_C_MAX - 1)
++
++// netlink attr 
++enum rkx_genl_attr
++{
++	RKX_A_UNSPEC,
++
++	// event
++	RKX_A_EVENT = 1, // nested
++
++	// binder
++	RKX_A_BINDER = 10,			 // nested
++	RKX_A_BINDER_TYPE = 11,		 // s32
++	RKX_A_BINDER_ONEWAY = 12,	 // s32
++	RKX_A_BINDER_FROM_PID = 13,	 // s32
++	RKX_A_BINDER_FROM_UID = 14,	 // s32
++	RKX_A_BINDER_TARGET_PID = 15, // s32
++	RKX_A_BINDER_TARGET_UID = 16, // s32
++	RKX_A_BINDER_CODE = 17,		 // s32
++	RKX_A_BINDER_RPC_NAME = 18,	 // nul_str
++
++	// signal
++	RKX_A_SIGNAL = 20,			 // nested
++	RKX_A_SIGNAL_SIGNAL = 21,	 // s32
++	RKX_A_SIGNAL_KILLER_PID = 22, // s32
++	RKX_A_SIGNAL_KILLER_UID = 23, // s32
++	RKX_A_SIGNAL_DST_PID = 24,	 // s32
++	RKX_A_SIGNAL_DST_UID = 25,	 // s32
++
++	// network
++	RKX_A_NETWORK = 30,			  // nested
++	RKX_A_NETWORK_PROTO = 31,	  // s32
++	RKX_A_NETWORK_TARGET_UID = 32, // s32
++	RKX_A_NETWORK_DATA_LEN = 33,	  // s32
++
++	RKX_A_UID = 40, // u32
++
++	// free-async rule
++	RKX_A_FREE_ASYNC_STRATEGY = 41, // u8
++	RKX_A_FREE_ASYNC_RPC_NAME = 42, // nul_str
++	RKX_A_FREE_ASYNC_CODE = 43,     // s32
++
++	__RKX_A_MAX = 49,
++};
++#define RKX_A_MAX __RKX_A_MAX
++
++// free async strategy
++enum rkx_free_async_strategy
++{
++	RKX_FREE_ASYNC_SKIP = 1,     // skip
++	RKX_FREE_ASYNC_BY_CODE = 2,  // code1 == code2
++	RKX_FREE_ASYNC_BY_DATA = 3,  // code1 == code2  && data1 == data2
++};
++
++// event types
++enum rkx_event_type
++{
++	RKX_EVT_BINDER = 1,
++	RKX_EVT_SIGNAL = 2,
++	RKX_EVT_NETWORK = 3,
++};
++
++// binder type
++enum rkx_binder_type
++{
++	RKX_BINDER_TRANSACTION = 1,
++	RKX_BINDER_REPLY = 2,
++	RKX_BINDER_FREE_BUFFER_FULL = 3,
++};
++
++// network protocol
++enum rkx_net_proto
++{
++	RKX_NET_PROTO_IPV4 = 4,
++	RKX_NET_PROTO_IPV6 = 6,
++};
++
++struct rkx_binder_event
++{
++	__u8 binder_type;
++	__u8 oneway;
++	__s32 from_pid;
++	__u32 from_uid;
++	__s32 target_pid;
++	__u32 target_uid;
++	__s32 code;
++	char rpc_name[INTERFACETOKEN_BUFF_SIZE];
++};
++
++struct rkx_signal_event
++{
++	__s32 signal;
++	__s32 killer_pid;
++	__u32 killer_uid;
++	__s32 dst_pid;
++	__u32 dst_uid;
++};
++
++struct rkx_network_event
++{
++	__u8 proto;
++	__u32 target_uid;
++	__s32 data_len;
++};
++
++struct rkx_event
++{
++	__u8 type;
++	union
++	{
++		struct rkx_binder_event binder;
++		struct rkx_signal_event signal;
++		struct rkx_network_event network;
++	} u;
++};
++
++// genl.c
++bool rkx_netlink_ready(void);
++int sendMessage(struct rkx_event *event);
++int register_genl(void);
++void unregister_genl(void);
++
++// net_uid.c
++bool net_uid_monitored_rcu(uid_t uid);
++void add_net_uid(uid_t uid);
++void del_net_uid(uid_t uid);
++void init_net_uid(void);
++void destroy_net_uid(void);
++
++// free_async.c
++bool free_async_has_entries(void);
++bool free_async_lookup_rcu(const char *rpc_name, s32 code, u8 *strategy_out);
++int add_free_async(const char *rpc_name, s32 code, u8 strategy);
++int del_free_async(const char *rpc_name, s32 code);
++void init_free_async(void);
++void destroy_free_async(void);
++
++// frozen.c
++bool line_is_frozen(struct task_struct *task);
++
++// netfilter.c
++int register_netfilter(void);
++void unregister_netfilter(void);
++
++/*
++ * Called from the patched kernel sources (CONFIG_REKERNEL_X):
++ *  - drivers/android/binder.c   -> rkx_binder_report()
++ *  - drivers/android/binder_alloc.c -> rkx_binder_free_async_warn()
++ *  - kernel/signal.c            -> rkx_signal_report()
++ */
++void rkx_binder_report(bool reply, struct task_struct *target_tsk,
++		       struct task_struct *from_tsk,
++		       struct binder_transaction_data *tr);
++void rkx_binder_free_async_warn(pid_t target_pid, size_t size,
++				size_t free_async_space);
++void rkx_signal_report(int sig, struct task_struct *killer,
++		       struct task_struct *dst);
++
++#endif
+diff --git a/drivers/rekernel_x/rkx_binder.c b/drivers/rekernel_x/rkx_binder.c
+new file mode 100644
+index 000000000..ccf6cc93e
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_binder.c
+@@ -0,0 +1,148 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_binder.c — Binder event reporting (4.19 in-tree port).
++ *
++ * The 4.19 non-GKI kernel has no android_vh_binder_* vendor hooks, so the
++ * call sites live in drivers/android/binder.c / binder_alloc.c (patched):
++ *  - binder_transaction()   -> rkx_binder_report(reply, target_tsk, from_tsk, tr)
++ *  - binder_alloc_new_buf_locked() -> rkx_binder_free_async_warn(pid, size, space)
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/version.h>
++#include <linux/uaccess.h>
++#include <linux/string.h>
++#include <uapi/linux/android/binder.h>
++#include "../android/binder_alloc.h"
++
++static void rkx_binder_send(struct task_struct *from, struct task_struct *to,
++			    u8 binder_type, bool oneway, s32 code,
++			    const char *rpc_name)
++{
++	struct rkx_event event;
++
++	if (!rkx_netlink_ready())
++		return;
++
++	memset(&event, 0, sizeof(event));
++	event.type = RKX_EVT_BINDER;
++	event.u.binder.binder_type = binder_type;
++	event.u.binder.oneway = oneway;
++	event.u.binder.from_pid = task_tgid_nr(from);
++	event.u.binder.from_uid = task_uid(from).val;
++	event.u.binder.target_pid = task_tgid_nr(to);
++	event.u.binder.target_uid = task_uid(to).val;
++	event.u.binder.code = code;
++	strscpy(event.u.binder.rpc_name, rpc_name ? rpc_name : "",
++		sizeof(event.u.binder.rpc_name));
++	sendMessage(&event);
++}
++
++/*
++ * Called from binder_transaction() (patched).  Replicates the semantics of
++ * the upstream android_vh_binder_trans / android_vh_binder_reply hooks.
++ */
++void rkx_binder_report(bool reply, struct task_struct *target_tsk,
++		       struct task_struct *from_tsk,
++		       struct binder_transaction_data *tr)
++{
++	char buf_data[INTERFACETOKEN_BUFF_SIZE];
++	char rpc_name[INTERFACETOKEN_BUFF_SIZE] = {0};
++	size_t buf_data_size;
++	int i = 0, j = 0;
++
++	if (unlikely(!target_tsk || !from_tsk || !tr))
++		return;
++
++	if (reply) {
++		if (task_uid(target_tsk).val > MAX_SYSTEM_UID ||
++		    from_tsk == target_tsk || !line_is_frozen(target_tsk))
++			return;
++		rkx_log_debug("Sync Binder Reply! from=%d | target=%d\n",
++			      task_uid(from_tsk).val, task_uid(target_tsk).val);
++		rkx_binder_send(from_tsk, target_tsk, RKX_BINDER_REPLY,
++				false, -1, "SYNC_BINDER_REPLY");
++		return;
++	}
++
++	/* transaction */
++	if (task_uid(target_tsk).val <= MIN_USERAPP_UID ||
++	    from_tsk == target_tsk || !line_is_frozen(target_tsk))
++		return;
++
++	if (tr->flags & TF_ONE_WAY) {
++		buf_data_size = tr->data_size > INTERFACETOKEN_BUFF_SIZE ?
++			INTERFACETOKEN_BUFF_SIZE : tr->data_size;
++		if (buf_data_size > PARCEL_OFFSET &&
++		    !copy_from_user(buf_data,
++				    (char __user *)tr->data.ptr.buffer,
++				    buf_data_size)) {
++			char *p = (char *)buf_data + PARCEL_OFFSET;
++
++			j = PARCEL_OFFSET + 1;
++			while (i < INTERFACETOKEN_BUFF_SIZE && j < buf_data_size &&
++			       *p != '\0') {
++				rpc_name[i++] = *p;
++				j += 2;
++				p += 2;
++			}
++			if (i == INTERFACETOKEN_BUFF_SIZE)
++				rpc_name[i - 1] = '\0';
++		}
++		rkx_log_debug("ASync Binder Transaction! from=%d | target=%d\n",
++			      task_uid(from_tsk).val, task_uid(target_tsk).val);
++		rkx_binder_send(from_tsk, target_tsk, RKX_BINDER_TRANSACTION,
++				true, tr->code, rpc_name);
++	} else {
++		rkx_log_debug("Sync Binder Transaction! from=%d | target=%d\n",
++			      task_uid(from_tsk).val, task_uid(target_tsk).val);
++		rkx_binder_send(from_tsk, target_tsk, RKX_BINDER_TRANSACTION,
++				false, -1, "SYNC_BINDER");
++	}
++}
++
++/*
++ * Called from binder_alloc_new_buf_locked() (patched) when an async buffer
++ * is about to be allocated.  Warns userspace that a frozen process is about
++ * to run out of async buffer space (FREE_BUFFER_FULL event).
++ */
++void rkx_binder_free_async_warn(pid_t target_pid, size_t size,
++				size_t free_async_space)
++{
++	struct task_struct *p;
++
++	if (free_async_space >= 3 * (size + sizeof(struct binder_buffer)) &&
++	    free_async_space >= WARN_AHEAD_SPACE)
++		return;
++
++	rcu_read_lock();
++	p = find_task_by_vpid(target_pid);
++	rcu_read_unlock();
++	if (!p || !line_is_frozen(p))
++		return;
++
++	rkx_log_debug("Binder Free buffer full! target=%d\n", target_pid);
++	if (rkx_netlink_ready()) {
++		struct rkx_event event = {0};
++
++		event.type = RKX_EVT_BINDER;
++		event.u.binder.binder_type = RKX_BINDER_FREE_BUFFER_FULL;
++		event.u.binder.oneway = 1;
++		event.u.binder.from_pid = task_tgid_nr(current);
++		event.u.binder.from_uid = task_uid(current).val;
++		event.u.binder.target_pid = task_tgid_nr(p);
++		event.u.binder.target_uid = task_uid(p).val;
++		event.u.binder.code = -1;
++		strscpy(event.u.binder.rpc_name, "FREE_BUFFER_FULL",
++			sizeof(event.u.binder.rpc_name));
++		sendMessage(&event);
++	}
++}
+diff --git a/drivers/rekernel_x/rkx_free_async.c b/drivers/rekernel_x/rkx_free_async.c
+new file mode 100644
+index 000000000..1bbd538ad
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_free_async.c
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * File: rkx_free_async.c — free async rule management.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/hashtable.h>
++#include <linux/slab.h>
++#include <linux/rcupdate.h>
++#include <linux/string.h>
++#include <linux/jhash.h>
++#include <linux/atomic.h>
++
++#define RKX_FREE_ASYNC_HASH_BITS 6
++
++struct free_async_entry {
++	char rpc_name[INTERFACETOKEN_BUFF_SIZE];
++	s32 code;
++	u8 strategy;
++	struct hlist_node hnode;
++	struct rcu_head rcu;
++};
++
++static DEFINE_HASHTABLE(rkx_free_async_map, RKX_FREE_ASYNC_HASH_BITS);
++static DEFINE_MUTEX(rkx_free_async_mutex);
++static atomic_t rkx_free_async_count = ATOMIC_INIT(0);
++
++static inline u32 free_async_hash(const char *rpc_name)
++{
++	return jhash(rpc_name, strlen(rpc_name), 0);
++}
++
++static bool free_async_strategy_valid(u8 strategy)
++{
++	return strategy == RKX_FREE_ASYNC_SKIP ||
++	       strategy == RKX_FREE_ASYNC_BY_CODE ||
++	       strategy == RKX_FREE_ASYNC_BY_DATA;
++}
++
++bool free_async_has_entries(void)
++{
++	return atomic_read(&rkx_free_async_count) > 0;
++}
++
++bool free_async_lookup_rcu(const char *rpc_name, s32 code, u8 *strategy_out)
++{
++	struct free_async_entry *entry;
++	u32 key;
++	u8 exact_strategy = 0;
++	u8 wild_strategy = 0;
++
++	if (!rpc_name || !strategy_out || !free_async_has_entries())
++		return false;
++
++	key = free_async_hash(rpc_name);
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(rkx_free_async_map, entry, hnode, key) {
++		if (strcmp(entry->rpc_name, rpc_name))
++			continue;
++		if (entry->code == code) {
++			exact_strategy = READ_ONCE(entry->strategy);
++			break;
++		}
++		if (entry->code == -1)
++			wild_strategy = READ_ONCE(entry->strategy);
++	}
++	rcu_read_unlock();
++
++	if (exact_strategy) {
++		*strategy_out = exact_strategy;
++		return true;
++	}
++	if (wild_strategy) {
++		*strategy_out = wild_strategy;
++		return true;
++	}
++	return false;
++}
++
++int add_free_async(const char *rpc_name, s32 code, u8 strategy)
++{
++	struct free_async_entry *entry;
++	size_t len;
++	u32 key;
++	bool found = false;
++
++	if (!rpc_name || !*rpc_name || code < -1 || !free_async_strategy_valid(strategy))
++		return -EINVAL;
++
++	len = strnlen(rpc_name, INTERFACETOKEN_BUFF_SIZE);
++	if (len == 0 || len >= INTERFACETOKEN_BUFF_SIZE)
++		return -EINVAL;
++
++	key = free_async_hash(rpc_name);
++
++	mutex_lock(&rkx_free_async_mutex);
++	hash_for_each_possible(rkx_free_async_map, entry, hnode, key) {
++		if (entry->code == code && !strcmp(entry->rpc_name, rpc_name)) {
++			WRITE_ONCE(entry->strategy, strategy);
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++		if (!entry) {
++			mutex_unlock(&rkx_free_async_mutex);
++			return -ENOMEM;
++		}
++		strscpy(entry->rpc_name, rpc_name, sizeof(entry->rpc_name));
++		entry->code = code;
++		entry->strategy = strategy;
++		hash_add_rcu(rkx_free_async_map, &entry->hnode, key);
++		atomic_inc(&rkx_free_async_count);
++	}
++	mutex_unlock(&rkx_free_async_mutex);
++
++	rkx_log_debug("addFreeAsync rpc=%s code=%d strategy=%u\n",
++		rpc_name, code, strategy);
++	return 0;
++}
++
++int del_free_async(const char *rpc_name, s32 code)
++{
++	struct free_async_entry *entry;
++	u32 key;
++	bool found = false;
++
++	if (!rpc_name || !*rpc_name || code < -1)
++		return -EINVAL;
++
++	key = free_async_hash(rpc_name);
++
++	mutex_lock(&rkx_free_async_mutex);
++	hash_for_each_possible(rkx_free_async_map, entry, hnode, key) {
++		if (entry->code == code && !strcmp(entry->rpc_name, rpc_name)) {
++			hash_del_rcu(&entry->hnode);
++			kfree_rcu(entry, rcu);
++			atomic_dec(&rkx_free_async_count);
++			found = true;
++			break;
++		}
++	}
++	mutex_unlock(&rkx_free_async_mutex);
++
++	if (found)
++		rkx_log_debug("delFreeAsync rpc=%s code=%d\n", rpc_name, code);
++	return 0;
++}
++
++void destroy_free_async(void)
++{
++	struct free_async_entry *entry;
++	struct hlist_node *tmp;
++	int bkt;
++
++	mutex_lock(&rkx_free_async_mutex);
++	hash_for_each_safe(rkx_free_async_map, bkt, tmp, entry, hnode) {
++		hash_del_rcu(&entry->hnode);
++		kfree_rcu(entry, rcu);
++	}
++	atomic_set(&rkx_free_async_count, 0);
++	mutex_unlock(&rkx_free_async_mutex);
++	rcu_barrier();
++}
++
++void init_free_async(void)
++{
++	hash_init(rkx_free_async_map);
++	atomic_set(&rkx_free_async_count, 0);
++}
+diff --git a/drivers/rekernel_x/rkx_frozen.c b/drivers/rekernel_x/rkx_frozen.c
+new file mode 100644
+index 000000000..dadcb1dac
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_frozen.c
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_frozen.c — Kernel-version compatible frozen state predicate.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/freezer.h>
++#include <linux/cgroup.h>
++#include <linux/version.h>
++#include <linux/sched.h>
++
++static inline bool rkx_is_frozen_state_compatible(struct task_struct *task)
++{
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
++	return READ_ONCE(task->__state) & TASK_FROZEN;
++#else
++	return frozen(task);
++#endif
++}
++
++static inline bool rkx_is_jobctl_frozen_compatible(struct task_struct *task)
++{
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 0))
++	return cgroup_task_freeze(task);
++#else
++	return ((task->jobctl & JOBCTL_TRAP_FREEZE) != 0);
++#endif
++}
++
++bool line_is_frozen(struct task_struct *task)
++{
++	if (cgroup_task_frozen(task) || rkx_is_jobctl_frozen_compatible(task))
++		return true;
++
++	if (NULL == task->group_leader)
++		return false;
++
++	return rkx_is_frozen_state_compatible(task->group_leader) || freezing(task->group_leader);
++}
+diff --git a/drivers/rekernel_x/rkx_genl.c b/drivers/rekernel_x/rkx_genl.c
+new file mode 100644
+index 000000000..d351a951f
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_genl.c
+@@ -0,0 +1,271 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_genl.c — Generic Netlink transport.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/skbuff.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/version.h>
++#include <linux/netlink.h>
++#include <net/sock.h>
++#include <net/genetlink.h>
++
++static bool rkx_genl_registered = false;
++
++bool rkx_netlink_ready(void)
++{
++    return rkx_genl_registered;
++}
++
++static int rkx_genl_monitor_net(struct sk_buff *skb, struct genl_info *info)
++{
++    uid_t muid;
++
++    if (!info->attrs[RKX_A_UID])
++    {
++        return -EINVAL;
++    }
++
++    muid = (uid_t)nla_get_u32(info->attrs[RKX_A_UID]);
++    rkx_log_debug("addMonitorUid uid=%d\n", muid);
++    add_net_uid(muid);
++    return 0;
++}
++
++static int rkx_genl_del_monitor_net(struct sk_buff *skb, struct genl_info *info)
++{
++    uid_t muid;
++
++    if (!info->attrs[RKX_A_UID])
++    {
++        return -EINVAL;
++    }
++
++    muid = (uid_t)nla_get_u32(info->attrs[RKX_A_UID]);
++    rkx_log_debug("delMonitorNet uid=%d\n", muid);
++    del_net_uid(muid);
++    return 0;
++}
++
++static int rkx_genl_add_free_async(struct sk_buff *skb, struct genl_info *info)
++{
++    const char *rpc_name;
++    s32 code;
++    u8 strategy;
++    int rc;
++
++    if (!info->attrs[RKX_A_FREE_ASYNC_RPC_NAME] ||
++        !info->attrs[RKX_A_FREE_ASYNC_CODE] ||
++        !info->attrs[RKX_A_FREE_ASYNC_STRATEGY])
++    {
++        return -EINVAL;
++    }
++
++    rpc_name = nla_data(info->attrs[RKX_A_FREE_ASYNC_RPC_NAME]);
++    code = nla_get_s32(info->attrs[RKX_A_FREE_ASYNC_CODE]);
++    strategy = nla_get_u8(info->attrs[RKX_A_FREE_ASYNC_STRATEGY]);
++
++    rc = add_free_async(rpc_name, code, strategy);
++    if (rc)
++        return rc;
++    return 0;
++}
++
++static int rkx_genl_del_free_async(struct sk_buff *skb, struct genl_info *info)
++{
++    const char *rpc_name;
++    s32 code;
++    int rc;
++
++    if (!info->attrs[RKX_A_FREE_ASYNC_RPC_NAME] ||
++        !info->attrs[RKX_A_FREE_ASYNC_CODE])
++    {
++        return -EINVAL;
++    }
++
++    rpc_name = nla_data(info->attrs[RKX_A_FREE_ASYNC_RPC_NAME]);
++    code = nla_get_s32(info->attrs[RKX_A_FREE_ASYNC_CODE]);
++
++    rc = del_free_async(rpc_name, code);
++    if (rc)
++        return rc;
++    return 0;
++}
++
++static const struct nla_policy rkx_genl_policy[RKX_A_MAX + 1] = {
++    [RKX_A_EVENT] = {.type = NLA_NESTED},
++    [RKX_A_UID] = {.type = NLA_U32},
++    [RKX_A_FREE_ASYNC_STRATEGY] = {.type = NLA_U8},
++    [RKX_A_FREE_ASYNC_RPC_NAME] = {.type = NLA_NUL_STRING, .len = INTERFACETOKEN_BUFF_SIZE - 1},
++    [RKX_A_FREE_ASYNC_CODE] = {.type = NLA_S32},
++};
++
++static const struct genl_ops rkx_genl_ops[] = {
++    {
++        .cmd = RKX_C_ADD_MONITOR_NET,
++        .doit = rkx_genl_monitor_net,
++        .policy = rkx_genl_policy,
++    },
++    {
++        .cmd = RKX_C_DEL_MONITOR_NET,
++        .doit = rkx_genl_del_monitor_net,
++        .policy = rkx_genl_policy,
++    },
++    {
++        .cmd = RKX_C_ADD_FREE_ASYNC,
++        .doit = rkx_genl_add_free_async,
++        .policy = rkx_genl_policy,
++    },
++    {
++        .cmd = RKX_C_DEL_FREE_ASYNC,
++        .doit = rkx_genl_del_free_async,
++        .policy = rkx_genl_policy,
++    },
++};
++
++static const struct genl_multicast_group rkx_genl_mcgrps[] = {
++    {.name = RKX_GENL_MCGRP_NAME},
++};
++
++static struct genl_family rkx_genl_family = {
++    .name = RKX_GENL_FAMILY_NAME,
++    .version = RKX_GENL_VERSION,
++    .maxattr = RKX_A_MAX,
++    .module = THIS_MODULE,
++    .ops = rkx_genl_ops,
++    .n_ops = ARRAY_SIZE(rkx_genl_ops),
++    .mcgrps = rkx_genl_mcgrps,
++    .n_mcgrps = ARRAY_SIZE(rkx_genl_mcgrps),
++};
++
++int sendMessage(struct rkx_event *event)
++{
++    struct sk_buff *skb;
++    void *msg_head;
++    struct nlattr *evt, *payload;
++    int rc;
++
++    skb = genlmsg_new(nla_total_size(256), GFP_ATOMIC);
++    if (!skb)
++    {
++        rkx_log_err("genlmsg alloc failure!\n");
++        return LINE_ERROR;
++    }
++
++    msg_head = genlmsg_put(skb, 0, 0, &rkx_genl_family, 0, RKX_C_EVENT);
++    if (!msg_head)
++    {
++        rkx_log_err("genlmsg_put failure!\n");
++        nlmsg_free(skb);
++        return LINE_ERROR;
++    }
++
++    evt = nla_nest_start(skb, RKX_A_EVENT);
++    if (!evt)
++    {
++        goto nla_fail;
++    }
++
++    switch (event->type)
++    {
++    case RKX_EVT_BINDER:
++    {
++        struct rkx_binder_event *b = &event->u.binder;
++
++        payload = nla_nest_start(skb, RKX_A_BINDER);
++        if (!payload)
++            goto nla_fail;
++        if (nla_put_s32(skb, RKX_A_BINDER_TYPE, b->binder_type) ||
++            nla_put_s32(skb, RKX_A_BINDER_ONEWAY, b->oneway) ||
++            nla_put_s32(skb, RKX_A_BINDER_FROM_PID, b->from_pid) ||
++            nla_put_s32(skb, RKX_A_BINDER_FROM_UID, b->from_uid) ||
++            nla_put_s32(skb, RKX_A_BINDER_TARGET_PID, b->target_pid) ||
++            nla_put_s32(skb, RKX_A_BINDER_TARGET_UID, b->target_uid) ||
++            nla_put_s32(skb, RKX_A_BINDER_CODE, b->code) ||
++            nla_put_string(skb, RKX_A_BINDER_RPC_NAME, b->rpc_name))
++            goto nla_fail;
++        nla_nest_end(skb, payload);
++        break;
++    }
++    case RKX_EVT_SIGNAL:
++    {
++        struct rkx_signal_event *s = &event->u.signal;
++
++        payload = nla_nest_start(skb, RKX_A_SIGNAL);
++        if (!payload)
++            goto nla_fail;
++        if (nla_put_s32(skb, RKX_A_SIGNAL_SIGNAL, s->signal) ||
++            nla_put_s32(skb, RKX_A_SIGNAL_KILLER_PID, s->killer_pid) ||
++            nla_put_s32(skb, RKX_A_SIGNAL_KILLER_UID, s->killer_uid) ||
++            nla_put_s32(skb, RKX_A_SIGNAL_DST_PID, s->dst_pid) ||
++            nla_put_s32(skb, RKX_A_SIGNAL_DST_UID, s->dst_uid))
++            goto nla_fail;
++        nla_nest_end(skb, payload);
++        break;
++    }
++    case RKX_EVT_NETWORK:
++    {
++        struct rkx_network_event *n = &event->u.network;
++
++        payload = nla_nest_start(skb, RKX_A_NETWORK);
++        if (!payload)
++            goto nla_fail;
++        if (nla_put_s32(skb, RKX_A_NETWORK_PROTO, n->proto) ||
++            nla_put_s32(skb, RKX_A_NETWORK_TARGET_UID, n->target_uid) ||
++            nla_put_s32(skb, RKX_A_NETWORK_DATA_LEN, n->data_len))
++            goto nla_fail;
++        nla_nest_end(skb, payload);
++        break;
++    }
++    default:
++        goto nla_fail;
++    }
++
++    nla_nest_end(skb, evt);
++    genlmsg_end(skb, msg_head);
++
++    rc = genlmsg_multicast(&rkx_genl_family, skb, 0, 0, GFP_ATOMIC);
++    if (rc && rc != -ESRCH)
++    {
++        rkx_log_err("genlmsg_multicast failed, rc=%d\n", rc);
++        return LINE_ERROR;
++    }
++
++    return LINE_SUCCESS;
++
++nla_fail:
++    genlmsg_cancel(skb, msg_head);
++    nlmsg_free(skb);
++    rkx_log_err("sendMessage: nla_put failed\n");
++    return LINE_ERROR;
++}
++
++int register_genl(void)
++{
++    rkx_log_info("Trying to register Generic Netlink family......\n");
++
++    if (genl_register_family(&rkx_genl_family) != 0)
++    {
++        rkx_log_err("Failed to register genl family!\n");
++        return LINE_ERROR;
++    }
++    rkx_genl_registered = true;
++
++    rkx_log_info("Registered genl family! ID: %d\n", rkx_genl_family.id);
++    return LINE_SUCCESS;
++}
++
++void unregister_genl(void)
++{
++    if (rkx_genl_registered)
++    {
++        genl_unregister_family(&rkx_genl_family);
++        rkx_genl_registered = false;
++    }
++}
+diff --git a/drivers/rekernel_x/rkx_log.h b/drivers/rekernel_x/rkx_log.h
+new file mode 100644
+index 000000000..b7426efa6
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_log.h
+@@ -0,0 +1,18 @@
++#ifndef RKX_LOG_H
++#define RKX_LOG_H
++
++/* Include this header FIRST in each .c — pr_fmt must be defined before printk.h. */
++#define pr_fmt(fmt) "[ReKernel-X] " fmt
++#include <linux/printk.h>
++
++#define rkx_log_info(fmt, ...)  pr_info(fmt, ##__VA_ARGS__)
++#define rkx_log_err(fmt, ...)   pr_err(fmt, ##__VA_ARGS__)
++#define rkx_log_warn(fmt, ...)  pr_warn(fmt, ##__VA_ARGS__)
++
++#ifdef RKX_DEBUG
++#define rkx_log_debug(fmt, ...)  pr_info(fmt, ##__VA_ARGS__)
++#else
++#define rkx_log_debug(fmt, ...)  no_printk(fmt, ##__VA_ARGS__)
++#endif
++
++#endif /* RKX_LOG_H */
+diff --git a/drivers/rekernel_x/rkx_netfilter.c b/drivers/rekernel_x/rkx_netfilter.c
+new file mode 100644
+index 000000000..d8ec613a6
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_netfilter.c
+@@ -0,0 +1,218 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_netfilter.c — Netfilter hooks & traffic metrics per UID.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/skbuff.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/version.h>
++#include <linux/netdevice.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_ipv6.h>
++#include <net/rtnetlink.h>
++#include <net/sock.h>
++#include <net/ip.h>
++#include <net/ipv6.h>
++#include <net/tcp.h>
++#include <linux/rcupdate.h>
++
++static inline uid_t line_sock2uid(struct sock *sk)
++{
++	if (sk && sk->sk_socket)
++		return SOCK_INODE(sk->sk_socket)->i_uid.val;
++	else
++		return 0;
++}
++
++/*
++ * Parse TCP payload length from an IPv4 packet.
++ * Returns 0 on success, -1 if the packet should be passed through.
++ */
++static int parse_tcp_ipv4(struct sk_buff *skb, __u8 *proto, int *data_len)
++{
++	struct iphdr *iph;
++	unsigned int ip_hdr_len;
++	struct tcphdr *th;
++
++	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
++		return -1;
++
++	iph = ip_hdr(skb);
++	if (iph->protocol != IPPROTO_TCP)
++		return -1;
++
++	ip_hdr_len = iph->ihl << 2;
++	if (!pskb_may_pull(skb, ip_hdr_len + sizeof(struct tcphdr)))
++		return -1;
++
++	iph = ip_hdr(skb);
++	th = (struct tcphdr *)((unsigned char *)iph + ip_hdr_len);
++	*data_len = ntohs(iph->tot_len) - ip_hdr_len - (th->doff << 2);
++
++	if (*data_len <= 0 && !th->syn && !th->fin && !th->rst)
++		return -1;
++
++	*proto = RKX_NET_PROTO_IPV4;
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++/*
++ * Parse TCP payload length from an IPv6 packet.
++ * Returns 0 on success, -1 if the packet should be passed through.
++ */
++static int parse_tcp_ipv6(struct sk_buff *skb, __u8 *proto, int *data_len)
++{
++	unsigned int thoff = 0;
++	unsigned short frag_off = 0;
++	struct ipv6hdr *iph6;
++	struct tcphdr *th;
++
++	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
++		return -1;
++
++	if (ipv6_find_hdr(skb, &thoff, -1, &frag_off, NULL) != IPPROTO_TCP)
++		return -1;
++
++	if (!pskb_may_pull(skb, thoff + sizeof(struct tcphdr)))
++		return -1;
++
++	iph6 = ipv6_hdr(skb);
++	th = (struct tcphdr *)(skb_network_header(skb) + thoff);
++	*data_len = ntohs(iph6->payload_len) - (thoff - sizeof(struct ipv6hdr))
++	          - (th->doff << 2);
++
++	if (*data_len <= 0 && !th->syn && !th->fin && !th->rst)
++		return -1;
++
++	*proto = RKX_NET_PROTO_IPV6;
++	return 0;
++}
++#endif
++
++static unsigned int rkx_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *skb,
++	const struct nf_hook_state *state)
++{
++	struct sock *sk;
++	uid_t uid;
++	int data_len;
++	__u8 proto;
++
++	if (!skb || !skb->len || !state)
++		return NF_ACCEPT;
++
++	if (state->hook != NF_INET_LOCAL_IN || !state->in)
++		return NF_ACCEPT;
++
++	sk = skb_to_full_sk(skb);
++	if (!sk || !sk_fullsock(sk))
++		return NF_ACCEPT;
++
++	uid = line_sock2uid(sk);
++	if (uid < MIN_USERAPP_UID)
++		return NF_ACCEPT;
++
++	rcu_read_lock();
++	if (!net_uid_monitored_rcu(uid)) {
++		rcu_read_unlock();
++		return NF_ACCEPT;
++	}
++	rcu_read_unlock();
++
++	if (ip_hdr(skb)->version == 4) {
++		if (parse_tcp_ipv4(skb, &proto, &data_len) < 0)
++			return NF_ACCEPT;
++#if IS_ENABLED(CONFIG_IPV6)
++	} else if (ip_hdr(skb)->version == 6) {
++		if (parse_tcp_ipv6(skb, &proto, &data_len) < 0)
++			return NF_ACCEPT;
++#endif
++	} else {
++		return NF_ACCEPT;
++	}
++
++	rkx_log_debug("Receive net data! target=%d\n", uid);
++	if (rkx_netlink_ready()) {
++		struct rkx_event event = {
++			.type = RKX_EVT_NETWORK,
++			.u.network = {
++				.proto = proto,
++				.target_uid = uid,
++				.data_len = data_len,
++			},
++		};
++		sendMessage(&event);
++	}
++
++	return NF_ACCEPT;
++}
++
++/* Only monitor input network packages */
++static struct nf_hook_ops rkx_nf_ops[] = {
++	{
++		.hook     = rkx_pkg_ipv4_ipv6_in,
++		.pf       = NFPROTO_IPV4,
++		.hooknum  = NF_INET_LOCAL_IN,
++		.priority = NF_IP_PRI_SELINUX_LAST + 1,
++	},
++#if IS_ENABLED(CONFIG_IPV6)
++	{
++		.hook     = rkx_pkg_ipv4_ipv6_in,
++		.pf       = NFPROTO_IPV6,
++		.hooknum  = NF_INET_LOCAL_IN,
++		.priority = NF_IP6_PRI_SELINUX_LAST + 1,
++	}
++#endif
++};
++
++static bool re_netfilter_registered;
++
++static void __unregister_netfilter(void)
++{
++	struct net *net;
++
++	rtnl_lock();
++	for_each_net(net) {
++		nf_unregister_net_hooks(net, rkx_nf_ops, ARRAY_SIZE(rkx_nf_ops));
++	}
++	rtnl_unlock();
++}
++
++void unregister_netfilter(void)
++{
++	if (re_netfilter_registered) {
++		__unregister_netfilter();
++		re_netfilter_registered = false;
++	}
++}
++
++int register_netfilter(void)
++{
++	int rc = LINE_SUCCESS;
++	struct net *net = NULL;
++
++	rtnl_lock();
++	for_each_net(net) {
++		rc = nf_register_net_hooks(net, rkx_nf_ops, ARRAY_SIZE(rkx_nf_ops));
++		if (rc != LINE_SUCCESS) {
++			rkx_log_err("register netfilter hooks failed, rc=%d\n", rc);
++			break;
++		}
++	}
++	rtnl_unlock();
++
++	if (rc != LINE_SUCCESS) {
++		__unregister_netfilter();
++		return LINE_ERROR;
++	}
++
++	re_netfilter_registered = true;
++	return LINE_SUCCESS;
++}
+diff --git a/drivers/rekernel_x/rkx_netuid.c b/drivers/rekernel_x/rkx_netuid.c
+new file mode 100644
+index 000000000..098d5a477
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_netuid.c
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_netuid.c — Network monitor UID hashmap management.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/hashtable.h>
++#include <linux/slab.h>
++#include <linux/rcupdate.h>
++
++/* hashmap for net monitor uids */
++#define RKX_NET_UID_HASH_BITS 6
++static DEFINE_HASHTABLE(rkx_net_uid_map, RKX_NET_UID_HASH_BITS);
++struct uid_info {
++	uid_t uid;
++	struct hlist_node hnode;
++	struct rcu_head rcu;
++};
++
++static DEFINE_MUTEX(rkx_net_uid_mutex);
++
++bool net_uid_monitored_rcu(uid_t uid)
++{
++	struct uid_info *entry;
++	bool found = false;
++
++	hash_for_each_possible_rcu(rkx_net_uid_map, entry, hnode, uid) {
++		if (entry->uid == uid) {
++			found = true;
++			break;
++		}
++	}
++	return found;
++}
++
++/* add a uid to the monitor map (no-op if already present). Caller must NOT hold the mutex. */
++void add_net_uid(uid_t uid)
++{
++	struct uid_info *entry;
++	bool found = false;
++
++	mutex_lock(&rkx_net_uid_mutex);
++	hash_for_each_possible(rkx_net_uid_map, entry, hnode, uid) {
++		if (entry->uid == uid) {
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++		if (entry) {
++			entry->uid = uid;
++			hash_add_rcu(rkx_net_uid_map, &entry->hnode, uid);
++		}
++	}
++	mutex_unlock(&rkx_net_uid_mutex);
++}
++
++/* remove a uid from the monitor map. Caller must NOT hold the mutex. */
++void del_net_uid(uid_t uid)
++{
++	struct uid_info *entry;
++
++	mutex_lock(&rkx_net_uid_mutex);
++	hash_for_each_possible(rkx_net_uid_map, entry, hnode, uid) {
++		if (entry->uid == uid) {
++			hash_del_rcu(&entry->hnode);
++			kfree_rcu(entry, rcu);
++			break;
++		}
++	}
++	mutex_unlock(&rkx_net_uid_mutex);
++}
++
++void destroy_net_uid(void)
++{
++	struct uid_info *entry;
++	struct hlist_node *tmp;
++	int bkt;
++
++	mutex_lock(&rkx_net_uid_mutex);
++	hash_for_each_safe(rkx_net_uid_map, bkt, tmp, entry, hnode) {
++		hash_del_rcu(&entry->hnode);
++		kfree_rcu(entry, rcu);
++	}
++	mutex_unlock(&rkx_net_uid_mutex);
++}
++
++void init_net_uid(void)
++{
++	hash_init(rkx_net_uid_map);
++}
+diff --git a/drivers/rekernel_x/rkx_signal.c b/drivers/rekernel_x/rkx_signal.c
+new file mode 100644
+index 000000000..10958d22e
+--- /dev/null
++++ b/drivers/rekernel_x/rkx_signal.c
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
++ * Based on Re-Kernel project by nep_timeline@outlook.com.
++ * File: rkx_signal.c — Signal event reporting (4.19 in-tree port).
++ *
++ * The 4.19 non-GKI kernel has no android_vh_do_send_sig_info vendor hook,
++ * so kernel/signal.c (patched) calls rkx_signal_report() directly.
++ */
++
++#include "rkx_log.h"
++#include "rkx.h"
++#include <linux/printk.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++
++void rkx_signal_report(int sig, struct task_struct *killer,
++		       struct task_struct *dst)
++{
++	if (!dst || !killer)
++		return;
++
++	if (!line_is_frozen(dst))
++		return;
++
++	if (sig != SIGKILL && sig != SIGTERM && sig != SIGABRT && sig != SIGQUIT)
++		return;
++
++	rkx_log_debug("Process Signal! signal=%d\n", sig);
++	if (rkx_netlink_ready()) {
++		struct rkx_event event = {0};
++
++		event.type = RKX_EVT_SIGNAL;
++		event.u.signal.signal = sig;
++		event.u.signal.killer_pid = task_tgid_nr(killer);
++		event.u.signal.killer_uid = task_uid(killer).val;
++		event.u.signal.dst_pid = task_tgid_nr(dst);
++		event.u.signal.dst_uid = task_uid(dst).val;
++		sendMessage(&event);
++	}
++}
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 808bdc260..237c1d1f2 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -55,6 +55,9 @@
+ #include <asm/unistd.h>
+ #include <asm/siginfo.h>
+ #include <asm/cacheflush.h>
++#ifdef CONFIG_REKERNEL_X
++#include <../drivers/rekernel_x/rkx.h>
++#endif /* CONFIG_REKERNEL_X */
+ #include "audit.h"	/* audit_signal_info() */
+ 
+ /*
+@@ -1265,10 +1268,13 @@ specific_send_sig_info(int sig, struct siginfo *info, struct task_struct *t)
+ }
+ 
+ int do_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
+-			enum pid_type type)
++		     enum pid_type type)
+ {
+ 	unsigned long flags;
+ 	int ret = -ESRCH;
++#ifdef CONFIG_REKERNEL_X
++	rkx_signal_report(sig, current, p);
++#endif /* CONFIG_REKERNEL_X */
+ 
+ 	if (lock_task_sighand(p, &flags)) {
+ 		ret = send_signal(sig, info, p, type);
