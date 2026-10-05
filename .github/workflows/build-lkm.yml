@@ -1,7 +1,8 @@
 name: Build Non-GKI LKM Kernel (OnePlus 8 / LOS 23.2)
 
 # 自动拉取 backslashxx/KernelSU 最新 master 提交,集成 LKM(kernelsu.ko + ksud)
-# + Re:Kernel + DroidSpaces,产出可 fastboot 直刷的 boot.img(v2 header)。
+# + ReKernel-X + DroidSpaces,可选 VFS 后端(HybridMount/NoMount 二选一),
+# 产出可 fastboot 直刷的 boot.img(v2 header)。
 #
 # 前置: 需要一个 v2 boot.img 作为基底(提供内核 Image/DTB 之外的 ramdisk+dtb+AVB)。
 #   - workflow_dispatch 输入 boot_img_url(推荐), 或
@@ -30,6 +31,16 @@ on:
         required: false
         type: string
         default: 'master'
+      vfs_hybridmount:
+        description: 'VFS backend: Hybrid Mount (mutually exclusive with NoMount)'
+        required: false
+        type: boolean
+        default: false
+      vfs_nomount:
+        description: 'VFS backend: NoMount (mutually exclusive with Hybrid Mount)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   # Device
@@ -42,6 +53,13 @@ env:
   MANAGER_REF: ${{ inputs.manager_ref || 'master' }}
   BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
 
+  # NoMount VFS backend. Pinned to a verified commit rather than the `dev`
+  # branch head: upstream commits almost daily, and a moving target makes the
+  # build unreproducible (the setup.sh clones the repo and symlinks its source
+  # tree, so an upstream refactor silently breaks us). Bump this deliberately
+  # after re-running the workflow once.
+  NOMOUNT_COMMIT: 'a159c0c225e67f180b7fb55ad78a77b0f98beb5b'
+
   # Toolchain
   CLANG: clang
   CLANG_TRIPLE: aarch64-linux-gnu-
@@ -51,7 +69,7 @@ env:
 
 jobs:
   build-lkm:
-    name: 'Build LKM boot.img (latest manager + ReKernel + DroidSpaces)'
+    name: 'Build LKM boot.img (latest manager + ReKernel-X + DroidSpaces)'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -97,38 +115,168 @@ jobs:
           echo "manager HEAD: $(git rev-parse HEAD)"
           echo "KSU_VERSION: $(grep -oP 'KSU_VERSION=\K[0-9]+' kernel/Makefile)"
 
-      - name: Patch kernel - Re:Kernel (auto-fallback to verified base)
+      - name: Validate VFS backend selection (mutually exclusive)
+        run: |
+          # Hybrid Mount and NoMount 互斥：它们都劫持同一层 VFS
+          # (inode_operations / file_operations / dentry_operations)，并各自使用
+          # 独立不兼容的 keyring 协议（HybridMount 用 "hm1"，NoMount 用
+          # "NOMOUNT"）。二者本来就是同源项目（HybridMount 的 vfs 子系统
+          # fork 自 NoMount），同一内核里出现两套驱动会互抢 hook、元模块
+          # 无法握手，严重时直接崩溃。
+          # 这里做前置校验，开了两个就立刻 fail，避免产出一个坏 boot.img。
+          #
+          # 用 ${VAR:-false} 兜底，防止 workflow_dispatch 未传该输入时变量为空
+          # 而被当成 false 处理不到。
+          HM="${{ inputs.vfs_hybridmount }}"
+          NM="${{ inputs.vfs_nomount }}"
+          HM="${HM:-false}"
+          NM="${NM:-false}"
+
+          COUNT=0
+          [ "$HM" = "true" ] && COUNT=$((COUNT + 1))
+          [ "$NM" = "true" ] && COUNT=$((COUNT + 1))
+
+          echo "VFS backend selection:"
+          echo "  VFS_HYBRIDMOUNT = $HM"
+          echo "  VFS_NOMOUNT     = $NM"
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo ""
+            echo "[-] ERROR: VFS backends are mutually exclusive, but $COUNT are enabled."
+            echo "[-] Hybrid Mount and NoMount both hijack the same VFS layer and"
+            echo "[-] use incompatible keyring protocols. Enable at most ONE of them."
+            exit 1
+          fi
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "[i] No VFS backend selected - building without path redirection."
+            VFS_LABEL=""
+          else
+            echo "[+] VFS backend check passed."
+            if [ "$HM" = "true" ]; then VFS_LABEL="hybridmount"; fi
+            if [ "$NM" = "true" ]; then VFS_LABEL="nomount"; fi
+          fi
+
+          # 产物名后缀：让下载者一眼看出这份内核带了哪个 VFS 后端，
+          # 避免"名字没写但实际集成了"的混淆。
+          if [ -n "$VFS_LABEL" ]; then
+            echo "VFS_LABEL=-$VFS_LABEL" >> $GITHUB_ENV
+          else
+            echo "VFS_LABEL=" >> $GITHUB_ENV
+          fi
+          echo "[+] Artifact suffix will be: '${VFS_LABEL:-(none)}'"
+
+      - name: Patch kernel - ReKernel-X + DroidSpaces (auto-fallback to verified base)
         run: |
           cd device_kernel
+          # ReKernel-X（myflavor / Sakion Team 的 Re:Kernel 后继）4.19 移植版：
+          # 改 binder.c / binder_alloc.c / kernel/signal.c + 新增 drivers/rekernel_x/。
+          # Kconfig/Makefile 的接线 hunk 已从补丁里剔除，改为这里手动做——
+          # 避免与其他步骤对 drivers/Kconfig、drivers/Makefile 的文本注入互相踩。
+          # DroidSpaces 的 cgroup 前缀补丁在同一处一并应用。
           apply_patches() {
-            patch -p1 < "$GITHUB_WORKSPACE/Patches/Rekernel/rekernel_extra.patch" && \
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/RekernelX/rkx-4.19.patch" && \
             patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
           }
           if apply_patches; then
-            echo "[+] DS/RK patches applied on $(git rev-parse HEAD) (latest)"
+            echo "[+] RKX/DS patches applied on $(git rev-parse HEAD) (latest)"
           else
             echo "[!] patches failed on latest, resetting and falling back to verified base $PATCH_BASE"
             git checkout -f -q . ; git clean -fd -q ; git reset -q --hard
             git fetch -q --depth=1 origin "$PATCH_BASE"
             git checkout -q "$PATCH_BASE"
             apply_patches || { echo "::error::patches also failed on $PATCH_BASE"; exit 1; }
-            echo "[+] DS/RK patches applied on $PATCH_BASE (verified base)"
+            echo "[+] RKX/DS patches applied on $PATCH_BASE (verified base)"
           fi
-          grep -q "rekernel" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL) += rekernel/\n" >> drivers/Makefile
-          grep -q 'rekernel' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel/Kconfig\"" drivers/Kconfig
+          # 手动接线（drivers/rekernel_x/ 的 Kconfig、Makefile 由补丁自带）
+          grep -q "rekernel_x" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL_X) += rekernel_x/\n" >> drivers/Makefile
+          grep -q 'rekernel_x' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel_x/Kconfig\"" drivers/Kconfig
           # Customize localversion: replace the auto "-g<hash>-dirty" suffix
           # with "-g<hash>-hotsteel-LKM" (no more -dirty)
           echo "-g$(git rev-parse --short HEAD)-hotsteel-LKM" > .scmversion
           echo "[+] scmversion: $(cat .scmversion)"
 
-      - name: DroidSpaces xt_qtaguid check (cgroup fix already applied above)
+      - name: DroidSpaces cgroup prefix fix check
         run: |
           cd device_kernel
+          # DroidSpaces 需要 cgroup 文件名前缀处理（上游 non-GKI 补丁 02）。
+          # 它已由 Patches/Droidspaces/cgroup.patch 在上面的 ReKernel-X 步骤里
+          # 一并应用，这里只做结果确认。
+          #
+          # 注：上游另有 non-GKI 补丁 01（fix_kernel_panic_in_xt_qtaguid），
+          # 但本内核（sm8250 / kona）根本没有 net/netfilter/xt_qtaguid.c，
+          # 该补丁无从谈起，对应的 .cocci 文件已从仓库移除。
           if [ -f net/netfilter/xt_qtaguid.c ]; then
-            echo "xt_qtaguid.c present - coccinelle patch not auto-applied, apply manually if needed"
+            echo "[i] xt_qtaguid.c present but unpatched - not needed on this kernel target"
           else
-            echo "[-] xt_qtaguid.c absent, skipped"
+            echo "[i] xt_qtaguid.c absent on this kernel - DroidSpaces patch 01 not applicable"
           fi
+          if grep -qF 'cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX)' kernel/cgroup/cgroup.c; then
+            echo "[+] cgroup file-prefix handling present (DroidSpaces patch 02 applied)."
+          else
+            echo "[-] cgroup file-prefix handling missing!"
+            false
+          fi
+
+      - name: Patch HybridMount VFS Subsystem
+        if: inputs.vfs_hybridmount == true
+        run: |
+          cd device_kernel
+          # ⚠️ 顺序约束：本步骤必须排在 ReKernel-X 步骤**之后**——那条步骤的
+          # fallback 逻辑会跑 `git clean -fd`，若 VFS 先打，未跟踪文件
+          # (fs/hybridmount/、fs/nomount 链接、NoMount/) 会被一并清掉。
+          #
+          # Hybrid Mount 的 VFS 后端不是内核通用 VFS，而是它自己的 hybridmount
+          # 子系统（fork 自 NoMount，重命名了符号、换了自己的 keyring 协议
+          # 和 wire magic "HYBRIDMO"）。上游只提供 5.10/5.15/6.1/6.6/6.12 的
+          # 预编译 .ko，4.19 属 legacy（<5.10），必须 built-in (=y)。
+          # 本仓库的补丁是 4.19 移植版：5 个纯新增文件 + fs/Kconfig、
+          # fs/Makefile 各一处接线，已在真实 4.19 内核上实测可编译
+          # (fs/hybridmount/hybridmount.o，0 错误 0 警告)。
+          cp "$GITHUB_WORKSPACE/Patches/HybridMount/hybridmount_patch_to_4.19.patch" ./
+          patch -p1 < hybridmount_patch_to_4.19.patch
+          rm -f hybridmount_patch_to_4.19.patch
+          # patch 成功后会留下 .orig 备份，清掉以免被后续的 find 误判
+          find . -name "*.orig" -delete
+          if [ -n "$(find . -name '*.rej')" ]; then
+            echo "[-] hybridmount_patch has rejected hunks:"
+            find . -name "*.rej"
+            false
+          fi
+          test -f fs/hybridmount/hybridmount.c || { echo "[-] fs/hybridmount/hybridmount.c missing"; false; }
+          grep -qF 'obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/' fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
+          grep -qF 'source "fs/hybridmount/Kconfig"' fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          echo "[+] Hybrid Mount VFS subsystem patched (built-in)."
+
+      - name: Patch NoMount VFS Subsystem
+        if: inputs.vfs_nomount == true
+        run: |
+          cd device_kernel
+          # ⚠️ 同上：必须排在 ReKernel-X 步骤之后（fallback 会 git clean -fd）。
+          #
+          # NoMount 与 Hybrid Mount 同源不同家：Hybrid Mount 的 hybridmount
+          # 子系统就是从 NoMount fork 出来的，但**重命名了符号、换了自己的
+          # wire magic**（NoMount 用 "NOMOUNT"），因此两套元模块与工具链
+          # 互不通用，同一内核只能存在一个。
+          #
+          # NoMount 官方仓库自带 kernel/setup.sh，做的是通用内核集成：
+          #   1. git clone 到 <kernel>/NoMount
+          #   2. checkout <commit-or-tag>（不传则跟 dev 最新）
+          #   3. ln -sfn NoMount/kernel/src fs/nomount
+          #   4. 追加 obj-$(CONFIG_NOMOUNT) += nomount/ 到 fs/Makefile
+          #   5. 在 fs/Kconfig 的**最后一个 endmenu** 前插 source 行
+          #
+          # 这里显式传入固定 commit（env.NOMOUNT_COMMIT）而不是让它跟 dev
+          # 分支头部：上游几乎每日提交，跟着头部会让构建不可复现，且上游一旦
+          # 重构目录结构，symlink 目标会静默失效。已实测该 commit 的源码在
+          # 本内核 4.19 上可编译 (fs/nomount/nomount.o，0 错误)。
+          curl -sSL "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_COMMIT}/kernel/setup.sh" | bash -s "$NOMOUNT_COMMIT"
+          find . -name "*.orig" -delete
+          test -d fs/nomount || { echo "[-] fs/nomount missing (symlink not created)"; false; }
+          test -f fs/nomount/nomount.c || { echo "[-] fs/nomount/nomount.c missing"; false; }
+          grep -q "nomount" fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
+          grep -q "fs/nomount/Kconfig" fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          echo "[+] NoMount VFS subsystem patched (built-in, commit ${NOMOUNT_COMMIT})."
 
       - name: Generate kernel config (defconfig + oplus + droidspaces, no LTO/CFI)
         run: |
@@ -142,12 +290,54 @@ jobs:
             scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
               arch/arm64/configs/vendor/oplus.config \
               "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
-          # Force no LTO / no CFI (CFI kernel cannot load a non-CFI ksu.ko), enable ReKernel
+          # Force no LTO / no CFI (CFI kernel cannot load a non-CFI ksu.ko), enable ReKernel-X
           ./scripts/config --file "$OUT/.config" \
             -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
-            -e REKERNEL -d REKERNEL_NETWORK
+            -e REKERNEL_X
+
+          # ---- VFS backend (optional, at most one) ----
+          # 必须在 olddefconfig **之前**写入：这些符号在当前 defconfig 里
+          # 没有被引用，olddefconfig 会把 orphan symbol 丢掉，只有先把值写进
+          # .config、再跑 olddefconfig 才会被保留下来。
+          case "$VFS_LABEL" in
+            -hybridmount)
+              # Hybrid Mount 用 keyring 驱动：它的子系统会 register_key_type()，
+              # 所以 CONFIG_KEYS 是硬依赖；CONFIG_ASSOCIATIVE_ARRAY 由 KEYS select。
+              # 原 defconfig 没显式写 CONFIG_KEYS=（是靠 CONFIG_FS_ENCRYPTION
+              # 经 fs/crypto select KEYS 传递过来的），这里显式写出，避免将来
+              # 关掉 FS_ENCRYPTION 时连带把 KEYS 弄丢。
+              # 4.19 无预编译 .ko，必须 =y 内置。
+              echo "CONFIG_KEYS=y" >> "$OUT/.config"
+              echo "CONFIG_ASSOCIATIVE_ARRAY=y" >> "$OUT/.config"
+              echo "CONFIG_HYBRIDMOUNT=y" >> "$OUT/.config"
+              ;;
+            -nomount)
+              # NoMount 同样走 keyring，依赖与 Hybrid Mount 一致。
+              echo "CONFIG_KEYS=y" >> "$OUT/.config"
+              echo "CONFIG_ASSOCIATIVE_ARRAY=y" >> "$OUT/.config"
+              echo "CONFIG_NOMOUNT=y" >> "$OUT/.config"
+              ;;
+            *)
+              echo "[i] No VFS backend requested - skipping VFS CONFIG entries."
+              ;;
+          esac
+
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL" "$OUT/.config"
+          grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_MODULE_SIG|^CONFIG_REKERNEL_X" "$OUT/.config"
+
+          # 校验选中的 VFS 后端确实进了 .config（防止上面写错符号名而静默跳过）
+          case "$VFS_LABEL" in
+            -hybridmount)
+              grep -qE '^CONFIG_HYBRIDMOUNT=y' "$OUT/.config" || { echo "[-] CONFIG_HYBRIDMOUNT did not stick"; false; }
+              grep -qE '^CONFIG_KEYS=y' "$OUT/.config" || { echo "[-] CONFIG_KEYS missing (Hybrid Mount hard dep)"; false; }
+              echo "[+] VFS: Hybrid Mount enabled in .config"
+              ;;
+            -nomount)
+              grep -qE '^CONFIG_NOMOUNT=y' "$OUT/.config" || { echo "[-] CONFIG_NOMOUNT did not stick"; false; }
+              grep -qE '^CONFIG_KEYS=y' "$OUT/.config" || { echo "[-] CONFIG_KEYS missing (NoMount hard dep)"; false; }
+              echo "[+] VFS: NoMount enabled in .config"
+              ;;
+          esac
 
       - name: Prepare kernel for out-of-tree module build
         run: |
@@ -192,7 +382,7 @@ jobs:
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image
           ls -la "$OUT/arch/arm64/boot/Image"
           # sanity check: no CFI in the built kernel
-          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_REKERNEL" || true
+          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_REKERNEL_X" || true
 
       - name: Obtain base boot.img (v2)
         run: |
@@ -230,7 +420,9 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: boot-patched-kernelsu-ds-rk
+          # VFS_LABEL 由 "Validate VFS backend selection" 步骤写入 $GITHUB_ENV：
+          # -hybridmount / -nomount / 空（未选后端），保证产物名与实际集成内容一致
+          name: boot-patched-kernelsu-ds-rk${{ env.VFS_LABEL }}
           path: |
             out_img/kernelsu_patched_*.img
             kernelsu/kernel/ksu.ko
