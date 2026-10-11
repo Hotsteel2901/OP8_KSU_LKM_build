@@ -1,0 +1,42 @@
+--- a/kernel/spoof_cmdline.c
++++ b/kernel/spoof_cmdline.c
+@@ -10,10 +10,34 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/version.h>
+ #include "susfs_abi.h"
+ #include "susfs_log.h"
+ #include "susfs.h"	/* susfs_abi_path_ok */
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
++/*
++ * 4.19 / non-GKI: bootconfig does not exist, so there is no /proc/bootconfig and
++ * no saved_boot_config symbol.  This file implements ONLY the bootconfig spoof,
++ * so build no-op stubs instead of referencing the missing symbol.  (Referencing
++ * it left saved_boot_config undefined in the .ko; the ksud/kernelsu loader could
++ * not relocate it from /proc/kallsyms and init_module() then failed with -ENOENT.)
++ */
++int susfs_spoof_cmdline_init(void)
++{
++	return 0;
++}
++
++void susfs_spoof_cmdline_exit(void)
++{
++}
++
++void susfs_spoof_cmdline_supercall(void __user **arg)
++{
++	/* Caller pre-seeds err = ERR_CMD_NOT_SUPPORTED (126); leave it as-is. */
++	(void)arg;
++}
++#else
+ /* unexported static var; ksud insmod relocates it via kallsyms */
+ extern char *saved_boot_config;
+ 
+@@ -148,3 +172,4 @@
+ 		pr_warn("cmdline supercall copy_to_user failed\n");
+ 	kfree(info);
+ }
++#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) */
