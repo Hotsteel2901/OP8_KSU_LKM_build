@@ -1,0 +1,80 @@
+diff --git a/kernel/sus_mount.c b/kernel/sus_mount.c
+index f89d59e..ba529fb 100644
+--- a/kernel/sus_mount.c
++++ b/kernel/sus_mount.c
+@@ -760,7 +760,19 @@ static void sus_mount_ns_walk_end(void)
+ #define SUS_MOUNT_ITER_TYPE		struct list_head *
+ #define SUS_MOUNT_ITER_FOR(ns, it)	for ((it) = (ns)->list.next; (it) != &(ns)->list; (it) = (it)->next)
+ #define SUS_MOUNT_ITER_MOUNT(it)	list_entry((it), struct mount, mnt_list)
++# if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
++/* 5.7 .. 6.11: ns->list is protected by the per-namespace spinlock and carries a fake
++ * "cursor" mount that has to be skipped. */
+ #define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns) || ((r)->mnt.mnt_flags & MNT_CURSOR))
++#define SUS_MOUNT_NS_LOCK(ns)		spin_lock(&(ns)->ns_lock)
++#define SUS_MOUNT_NS_UNLOCK(ns)		spin_unlock(&(ns)->ns_lock)
++# else
++/* pre-5.7 (4.19): there is no ns_lock and no cursor mount.  ns->list is walked relying
++ * on the namespace being private (the kretprobe path) - see the note above. */
++#define SUS_MOUNT_MNT_NOT_IN_NS(r, ns)	((r)->mnt_ns != (ns))
++#define SUS_MOUNT_NS_LOCK(ns)		do { } while (0)
++#define SUS_MOUNT_NS_UNLOCK(ns)		do { } while (0)
++# endif
+ #endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+@@ -773,7 +785,7 @@ static void sus_mount_learn_ns(struct mnt_namespace *ns)
+     struct mount *r;
+     int learned = 0;
+ 
+-    spin_lock(&ns->ns_lock);
++    SUS_MOUNT_NS_LOCK(ns);
+     SUS_MOUNT_ITER_FOR(ns, pos) {
+         int shown;
+ 
+@@ -790,7 +802,7 @@ static void sus_mount_learn_ns(struct mnt_namespace *ns)
+             learned++;
+         }
+     }
+-    spin_unlock(&ns->ns_lock);
++    SUS_MOUNT_NS_UNLOCK(ns);
+     atomic_inc(&n_clone_walks);
+     if (learned)
+         atomic_add(learned, &n_clone_learned);
+@@ -1276,6 +1288,11 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
+     if (sus_mount_is_su_domain())
+         return 0;
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
++    /* struct statx has no stx_mnt_id before 5.8; there is nothing to rewrite. */
++    (void)id; (void)shown; (void)new_id;
++    return 0;
++#else
+     atomic_inc(&n_statx_hits);
+     if (copy_from_user(&id, (void __user *)(ubuf + offsetof(struct statx, stx_mnt_id)),
+                        sizeof(id))) {
+@@ -1295,6 +1312,7 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
+     }
+     atomic_inc(&n_statx_rewrites);
+     return 0;
++#endif
+ }
+ 
+ static struct kretprobe kr_statx = {
+@@ -1857,7 +1875,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long
+ 
+     rcu_read_lock();
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+-    spin_lock(&ns->ns_lock);
++    SUS_MOUNT_NS_LOCK(ns);
+ #endif
+     SUS_MOUNT_ITER_FOR(ns, pos) {
+         struct path mnt_path;
+@@ -1943,7 +1961,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long
+         marked++;
+     }
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+-    spin_unlock(&ns->ns_lock);
++    SUS_MOUNT_NS_UNLOCK(ns);
+ #endif
+     rcu_read_unlock();
+     sus_mount_ns_walk_end();

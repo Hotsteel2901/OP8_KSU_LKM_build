@@ -31,6 +31,16 @@ on:
         required: false
         type: string
         default: 'master'
+      susfs_enable:
+        description: 'Integrate SUSFS-LKM (default on; off = build kernel + KSU LKM only, no susfs_guard_lkm.ko)'
+        required: true
+        type: boolean
+        default: true
+      susfs_lkm_ref:
+        description: 'SUSFS-LKM ref (branch/tag/commit) to pull'
+        required: false
+        type: string
+        default: 'legacy'
       vfs_hybridmount:
         description: 'VFS backend: Hybrid Mount (mutually exclusive with NoMount)'
         required: false
@@ -52,6 +62,10 @@ env:
   MANAGER_SOURCE: 'https://github.com/backslashxx/KernelSU.git'
   MANAGER_REF: ${{ inputs.manager_ref || 'master' }}
   BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
+
+  # SUSFS-LKM 源码（legacy 分支面向 pre-5.10；4.19 适配见 Patches/SUSFS-LKM/）
+  SUSFS_LKM_SOURCE: 'https://github.com/Hotsteel2901/susfs4ksu-lkm.git'
+  SUSFS_LKM_REF: ${{ inputs.susfs_lkm_ref || 'legacy' }}
 
   # NoMount VFS backend. Pinned to a verified commit rather than the `dev`
   # branch head: upstream commits almost daily, and a moving target makes the
@@ -165,6 +179,34 @@ jobs:
             echo "VFS_LABEL=" >> $GITHUB_ENV
           fi
           echo "[+] Artifact suffix will be: '${VFS_LABEL:-(none)}'"
+
+      - name: Resolve SUSFS-LKM label
+        run: |
+          # SUSFS-LKM 开关：关则跳过 SUSFS-LKM 的克隆/打补丁/编译，产物也不带
+          # susfs_guard_lkm.ko（内核本身不含 SUSFS，它只是外置模块）。
+          if [ "${{ inputs.susfs_enable }}" = "true" ]; then
+            echo "SUSFS_LABEL=" >> $GITHUB_ENV
+            echo "[i] SUSFS-LKM enabled (will build susfs_guard_lkm.ko)."
+          else
+            echo "SUSFS_LABEL=-nosusfs" >> $GITHUB_ENV
+            echo "[i] SUSFS-LKM disabled - building kernel + KSU LKM only."
+          fi
+
+      - name: Clone SUSFS-LKM + apply 4.19 adaptation patches
+        if: inputs.susfs_enable
+        run: |
+          git clone --depth=1 --single-branch -b "$SUSFS_LKM_REF" "$SUSFS_LKM_SOURCE" susfs_lkm
+          cd susfs_lkm
+          echo "SUSFS-LKM HEAD: $(git rev-parse HEAD) ($SUSFS_LKM_REF)"
+          # 4.19 适配补丁（按名字排序应用；目录内 README.md 说明适配地图）
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/Patches/SUSFS-LKM/*.patch; do
+            echo "[+] applying $(basename "$p")"
+            patch -p1 < "$p" || { echo "::error::$(basename "$p") failed to apply"; exit 1; }
+          done
+          if [ -n "$(find . -name '*.rej')" ]; then
+            echo "::error::SUSFS-LKM patches left .rej files:"; find . -name '*.rej'; exit 1
+          fi
 
       - name: Patch kernel - ReKernel-X + DroidSpaces (auto-fallback to verified base)
         run: |
@@ -384,6 +426,42 @@ jobs:
           # sanity check: no CFI in the built kernel
           ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_REKERNEL_X" || true
 
+      - name: Build SUSFS-LKM (susfs_guard_lkm.ko)
+        if: inputs.susfs_enable
+        run: |
+          cd susfs_lkm/kernel
+          # 外置构建，针对同一个已准备的内核树。SUSFS-LKM 通过运行时符号解析 +
+          # 自身 /proc 接口工作，未定义符号由 ksud 加载时从 /proc/kallsyms 解析。
+          set +e; set -o pipefail
+          make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
+            CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$JOBS" modules 2>&1 | tee /tmp/susfs_build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::SUSFS-LKM build failed (rc=$rc) — see Patches/SUSFS-LKM/README.md"
+            grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make|incompatible|implicit declaration' /tmp/susfs_build.log | tail -30 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
+          ls -la susfs_guard_lkm.ko
+
+      - name: Package SUSFS-LKM KernelSU module (susfs-lkm-module.zip)
+        if: inputs.susfs_enable
+        run: |
+          # SUSFS 是外置运行时模块，不会被 boot-patch 注入 boot.img。
+          # 这里把编好的 susfs_guard_lkm.ko 与模块模板打成一个 KernelSU 模块 zip，
+          # 在管理器里装一次即可开机自动 `ksud insmod`（见 susfs-module/README.md）。
+          rm -rf mod_stage
+          mkdir -p mod_stage
+          cp "$GITHUB_WORKSPACE"/susfs-module/module.prop mod_stage/
+          cp "$GITHUB_WORKSPACE"/susfs-module/post-fs-data.sh mod_stage/
+          cp "$GITHUB_WORKSPACE"/susfs-module/service.sh mod_stage/
+          cp susfs_lkm/kernel/susfs_guard_lkm.ko mod_stage/
+          chmod 755 mod_stage/*.sh
+          rm -f susfs-lkm-module.zip
+          ( cd mod_stage && zip -r9 "$GITHUB_WORKSPACE/susfs-lkm-module.zip" . )
+          unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip"
+
       - name: Obtain base boot.img (v2)
         run: |
           mkdir -p base_out
@@ -422,8 +500,10 @@ jobs:
         with:
           # VFS_LABEL 由 "Validate VFS backend selection" 步骤写入 $GITHUB_ENV：
           # -hybridmount / -nomount / 空（未选后端），保证产物名与实际集成内容一致
-          name: boot-patched-kernelsu-ds-rk${{ env.VFS_LABEL }}
+          name: boot-patched-kernelsu-ds-rk${{ env.VFS_LABEL }}${{ env.SUSFS_LABEL }}
           path: |
             out_img/kernelsu_patched_*.img
             kernelsu/kernel/ksu.ko
+            susfs_lkm/kernel/susfs_guard_lkm.ko
+            susfs-lkm-module.zip
           if-no-files-found: error

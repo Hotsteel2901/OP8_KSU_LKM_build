@@ -1,0 +1,14 @@
+diff --git a/kernel/susfs_kstat.c b/kernel/susfs_kstat.c
+index 9fb92e9..3d9c058 100644
+--- a/kernel/susfs_kstat.c
++++ b/kernel/susfs_kstat.c
+@@ -667,7 +667,8 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
+ 
+ 	if (ret != 0)
+ 		return;
+-	syscall_get_arguments(current, regs, args);
++	/* this tree's arm64 header takes the 5-arg form (task, regs, i, n, args) */
++	syscall_get_arguments(current, regs, 0, 6, args);
+ 	nr = syscall_get_nr(current, regs);
+ 
+ 	/* The statbuf argument is NOT the same one for every syscall, so the NULL check has to live

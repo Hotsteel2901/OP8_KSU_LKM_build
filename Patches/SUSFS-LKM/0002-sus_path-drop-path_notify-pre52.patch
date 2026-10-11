@@ -1,0 +1,74 @@
+diff --git a/kernel/sus_path.c b/kernel/sus_path.c
+index a667375..5e64fa1 100644
+--- a/kernel/sus_path.c
++++ b/kernel/sus_path.c
+@@ -738,8 +738,10 @@ static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
+ 				   const void *value, size_t size, int flags);
+ static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
+ 				      struct dentry *dentry, const char *name);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ static int sus_path_path_notify(const struct path *path, u64 mask,
+ 				unsigned int obj_type);
++#endif
+ 
+ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(sb_statfs),
+ 					   typeof(&sus_path_sb_statfs)),
+@@ -759,9 +761,11 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_setxattr),
+ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_removexattr),
+ 					   typeof(&sus_path_inode_removexattr)),
+ 	      "inode_removexattr hook signature mismatch");
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(path_notify),
+ 					   typeof(&sus_path_path_notify)),
+ 	      "path_notify hook signature mismatch");
++#endif
+ 
+ static struct ksu_lsm_hook sus_path_statfs_hook =
+ 	KSU_LSM_HOOK_INSERT(sb_statfs, (void *)sus_path_sb_statfs);
+@@ -781,8 +785,10 @@ static struct ksu_lsm_hook sus_path_setxattr_hook =
+ static struct ksu_lsm_hook sus_path_removexattr_hook =
+ 	KSU_LSM_HOOK_INSERT(inode_removexattr, (void *)sus_path_inode_removexattr);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ static struct ksu_lsm_hook sus_path_notify_hook =
+ 	KSU_LSM_HOOK_INSERT(path_notify, (void *)sus_path_path_notify);
++#endif
+ 
+ static struct ksu_lsm_hook sus_path_getattr_hook =
+ 	KSU_LSM_HOOK_INSERT(inode_getattr, (void *)sus_path_inode_getattr);
+@@ -1053,6 +1059,7 @@ static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
+     return 0;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int obj_type)
+ {
+     /* inotify_add_watch and fanotify_mark arrive here; their callers do not run an
+@@ -1062,6 +1069,7 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int
+     SUS_LSM_PASS_ORIG(sus_path_notify_hook, path_notify, path, mask, obj_type);
+     return 0;
+ }
++#endif
+ 
+ /* Every hook below the LSM layer is only worth its cost once something is registered: kprobe
+  * entry costs a brk trap per hit.  With no rules there is nothing to answer, so they are armed on
+@@ -2083,7 +2091,9 @@ int sus_path_init(void)
+             &sus_path_statfs_hook, &sus_path_setattr_hook,
+             &sus_path_getxattr_hook, &sus_path_listxattr_hook,
+             &sus_path_setxattr_hook, &sus_path_removexattr_hook,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+             &sus_path_notify_hook,
++#endif
+         };
+         int i;
+ 
+@@ -2163,7 +2173,9 @@ void sus_path_exit(void)
+             &sus_path_statfs_hook, &sus_path_setattr_hook,
+             &sus_path_getxattr_hook, &sus_path_listxattr_hook,
+             &sus_path_setxattr_hook, &sus_path_removexattr_hook,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+             &sus_path_notify_hook,
++#endif
+         };
+         int i;
+ 
