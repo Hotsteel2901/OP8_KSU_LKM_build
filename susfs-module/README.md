@@ -24,8 +24,9 @@ KernelSU 的 `ksud boot-patch` 只把 `ksu.ko` 注入 boot 的 ramdisk；SUSFS �
 - `post-fs-data.sh`：尽量早地加载（`ksud` 就绪后立即 `insmod`）。
 - `service.sh`：late_start 兜底（若上一阶段没加载成功再试一次）。
 
-两个脚本都是幂等的：先检查 `/proc/modules` 里是否已有 `susfs_guard_lkm`，已加载则跳过；
-任何失败都只写日志、`exit 0`，不会阻塞开机。
+两个脚本都是幂等的：先检查 `/sys/module/susfs_guard_lkm`（SUSFS 会把自己从
+`/proc/modules` 中隐藏，包括 root，所以 `lsmod` 里看不到）以及 `/proc/modules`，
+已加载则跳过；任何失败都只写日志、`exit 0`，不会阻塞开机。
 
 ## 日志 / 排查
 

@@ -1,7 +1,4 @@
 #!/system/bin/sh
-# SUSFS-LKM loader (post-fs-data stage).
-# Loads the external susfs_guard_lkm.ko as early as possible via `ksud insmod`.
-# Never blocks boot: always exits 0.
 
 MODDIR=${0%/*}
 LOG=/data/adb/susfs_lkm.log
@@ -10,8 +7,7 @@ TAG="susfs_lkm/post-fs-data"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$TAG] $*" >> "$LOG" 2>/dev/null; }
 
-# Already loaded?
-if grep -q '^susfs_guard_lkm ' /proc/modules 2>/dev/null; then
+if [ -d /sys/module/susfs_guard_lkm ] || grep -q '^susfs_guard_lkm ' /proc/modules 2>/dev/null; then
     exit 0
 fi
 
@@ -30,7 +26,6 @@ find_ksud() {
 
 KSUD=$(find_ksud)
 
-# Wait (briefly) for the KernelSU userspace daemon to show up.
 i=0
 while [ -z "$KSUD" ] && [ "$i" -lt 20 ]; do
     i=$((i + 1))

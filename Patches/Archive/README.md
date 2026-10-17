@@ -60,3 +60,75 @@
 3. 干净 4.19 树：RKX + cgroup 干跑/实跑 → `CONFIG_REKERNEL_X=y` → `make drivers/rekernel_x/`
 4. 同树：HM 补丁 0 rej → `CONFIG_HYBRIDMOUNT=y` → `make fs/hybridmount/`；NM setup.sh 固定 commit → `CONFIG_NOMOUNT=y` → `make fs/nomount/`
 5. CI 双跑：`vfs_hybridmount=true` 与 `vfs_nomount=true` 各出一份 boot.img
+
+---
+
+## 2026-10-17:基底刷新 + 与 BakaSU 仓库同步的 SUSFS 修复（backslashxx KSU 不变）
+
+本仓库仍使用 **backslashxx/KernelSU**，不换成 BakaSU。本次同步的是内核侧/CI/模块侧的
+通用修复，以及新的基底 boot.img。
+
+### 1. 基底 boot.img
+
+换成 `/home/hhg/InfinityX/src/out/target/product/instantnoodle/boot.img`（本地
+Android 17 / InfinityX 4.0 构建）：
+
+- sha256 `c69aea5da7187d395ada6637697f8364df33c8409f1fff0e7f63cf56ed782df0`
+- header v2、page 4096、kernel 56915992 B、ramdisk 1749287 B、dtb 1428199 B、AVB
+- 内核 commit `98a7970af93b`（= LineageOS lineage-23.2 HEAD，也是 CI 会构建的版本）
+
+### 2. SUSFS-LKM 修复
+
+| 补丁/改动 | 说明 |
+|---|---|
+| `Patches/SUSFS-LKM/0005`（已有） | 4.19 无 bootconfig，`saved_boot_config` 不存在；引用它会让 `init_module()` 返回 `-ENOENT` |
+| `Patches/SUSFS-LKM/0006`（新增） | 4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`，只有 `pmd_sect()`/`pud_sect()`。`phys_from_virt()` 缺段映射分支 → `security_hook_heads` 的 LSM 插入 `-ENOENT` → fatal 的 `sus_path` 层拒绝整个模块 |
+| CI `Verify external modules` | `ksu.ko` / `susfs_guard_lkm.ko` 的 GLOBAL 未定义符号逐个对照 `System.map`，并检查 vermagic 与 `UTS_RELEASE` 一致 |
+| `susfs-module/*` | 判重改用 `/sys/module/susfs_guard_lkm`（SUSFS 会从 `/proc/modules` 自隐藏）；删除脚本注释；`description=Module to load susfs-lkm` |
+
+### 3. 为什么这里不需要 BakaSU 的 ksuinit 补丁
+
+BakaSU 的 ksuinit 用了 Linux 5.2+ 的 `fsopen/fsconfig/fsmount/move_mount`，在 4.19 上
+挂不上 `/proc`，导致 `kernelsu.ko` 不加载。本仓库用的 backslashxx/KernelSU 的 ksuinit
+**本来就是经典 `mount(2)`**（反汇编确认：syscall 40，无 429–432），所以无需该补丁。
+这是两个仓库最容易混淆的地方。
+
+### 4. 踩坑：弱未定义符号不能被 CI 符号检查误杀
+
+`ksu.ko` 在 4.19 上有：
+
+```
+                 w path_umount
+```
+
+`path_umount` 在 `< 5.9` 是 `extern ... __weak`（KernelSU 会在没 backport 时回落
+`ksyscall(umount)`）。内核加载器允许弱未定义符号保持未解析，但 `nm -u` 会把它列出来；
+如果 CI 把"所有未定义符号"都当致命错误，会误杀构建。检查必须只看 **GLOBAL**
+未定义（`awk '$1 == "U"'`），忽略 `w`/`v`。
+
+### 5. 本地验证（2026-10-17）
+
+组合：内核 `98a7970af93b` + RKX + DroidSpaces + **NoMount** + no-LTO/CFI + KPROBES；
+backslashxx/KernelSU master `6c616c9` + `ksud-v2.patch`；SUSFS legacy `0b197bf` + 0001–0006。
+
+| 校验 | 结果 |
+|---|---|
+| 内核 | 编译成功，`4.19.325-cip136-st20-perf-g98a7970af93b-hotsteel-LKM` |
+| `CONFIG_NOMOUNT` / `KEYS` / `ASSOCIATIVE_ARRAY` / `REKERNEL_X` | 全部 `=y`；`vmlinux` 有 `__initcall_nomount_init5` |
+| `ksu.ko` | 213 个 GLOBAL 未定义，0 缺失；`path_umount` 为 WEAK，允许 |
+| `susfs_guard_lkm.ko` | 89 个 GLOBAL 未定义，0 缺失；无 `saved_boot_config` |
+| vermagic | 两个模块均与内核一致 |
+| ksuinit | syscall 40 (`mount(2)`)，无 429–432 |
+| 端到端 | `swap_kernel.py` + `ksud boot-patch` 成功；最终 100663296 B / header v2，ramdisk 内 `init`/`kernelsu.ko` 的 md5 与构建产物一致，内核 `extract-ikconfig` 可见 `CONFIG_NOMOUNT=y` |
+
+本地产物（`~/桌面/op8-ksu-local-build/`）：
+
+| 文件 | sha256 |
+|---|---|
+| `boot-patched-kernelsu-ds-rk-nomount-local.img` | `d451505848c6a60fc8dd3ea4c0fb73f62627edbc548a007a99e9f8759e30fbee` |
+| `ksu.ko` | `0bec18d9f815a81d6578c74f0be03269286039887c90cb6afaa9f57cfb3a595a` |
+| `susfs_guard_lkm.ko` | `f271531c22e7d28c59f3f8b8bb5fffb0912739bf1110b695f66dc03530656d2f` |
+| `susfs-lkm-module-ksu.zip` | `16064250b662270972135609793536c46425d342b69dc6d3f77a73a16de35da6` |
+
+> 设备侧未刷入本仓库的 boot.img（当前测试机跑的是 BakaSU 那套）。SUSFS 的 0006 修复
+> 已在该机器的 BakaSU 内核上真机验证通过；本仓库的 kernel/module 编译与符号校验同上。

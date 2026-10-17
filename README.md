@@ -2,7 +2,7 @@
 
 **OnePlus 8 (instantnoodle / sm8250 / kona) · LineageOS 23.2 (4.19.325) · KernelSU LKM 模式**
 
-自动拉取 [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU) **最新 master 提交**,集成 **LKM(kernelsu.ko + ksud)** + **ReKernel-X** + **DroidSpaces**,可选 **VFS 后端**(HybridMount / NoMount 二选一,默认关),产出可 `fastboot` 直刷的 **boot.img(header v2)**。
+自动拉取 [backslashxx/KernelSU](https://github.com/backslashxx/KernelSU) **最新 master 提交**,集成 **LKM(ksu.ko + ksud)** + **SUSFS-LKM** + **ReKernel-X** + **DroidSpaces**,可选 **VFS 后端**(HybridMount / NoMount 二选一,默认关),产出可 `fastboot` 直刷的 **boot.img(header v2)**。
 
 ---
 
@@ -10,7 +10,7 @@
 
 1. Fork 本仓库,启用 Actions(`Settings → Actions → General → Workflow permissions: Read and write`)。
 2. 准备基底 boot.img(**header v2**):
-   - 仓库已内置 `base/boot.img`(LOS 23.2 kebab 官方 ramdisk+dtb),**默认直接用,`boot_img_url` 可不填**;
+   - 仓库已内置 `base/boot.img`(InfinityX 4.0 / Android 17,header v2,ramdisk+dtb+AVB 完整),**默认直接用,`boot_img_url` 可不填**;
    - 想用自己的基底,Run workflow 时在 `boot_img_url` 填直链即可覆盖。
    - 基底用于提供 **ramdisk + dtb + AVB footer**,内核会被替换,ramdisk 会被注入 ksud/ksu.ko。
 3. `Actions → Build Non-GKI LKM Kernel → Run workflow`。
@@ -38,14 +38,17 @@
 
 | 文件 | 说明 |
 |---|---|
-| `boot-patched-kernelsu-ds-rk[-hybridmount\|-nomount].img` | **刷这个**。header v2、no-LTO 内核、ramdisk 注入 ksuinit + ksu.ko。产物名后缀标明本次集成的 VFS 后端,没有后缀 = 纯净内核 |
+| `boot-patched-kernelsu-ds-rk[-hybridmount\|-nomount][-nosusfs].img` | **刷这个**。header v2、no-LTO 内核、ramdisk 注入 ksuinit + ksu.ko。产物名后缀标明本次集成的 VFS 后端/SUSFS 开关 |
 | `ksu.ko` | 与最终内核配置匹配的 LKM 驱动 |
+| `susfs_guard_lkm.ko` | SUSFS-LKM,开机后由 userspace 通过 `ksud insmod` 加载 |
+| `susfs-lkm-module.zip` | 把 `susfs_guard_lkm.ko` 打包成 KernelSU 模块,装一次即可开机自动加载 |
 
 ## 集成内容
 
 | 组件 | 说明 |
 |---|---|
 | **KernelSU LKM** | `backslashxx/KernelSU` 最新 master;`ksu.ko` 外置编译,`ksud` 被打了 v2 补丁(原版只认 v3+ 头) |
+| **SUSFS-LKM** | [Hotsteel2901/susfs4ksu-lkm](https://github.com/Hotsteel2901/susfs4ksu-lkm) `legacy` + 本仓库 4.19 适配补丁;`susfs_guard_lkm.ko` 由 `ksud insmod` 在开机后加载 |
 | **ReKernel-X** | `Patches/RekernelX/rkx-4.19.patch`(4.19 移植版)+ `CONFIG_REKERNEL_X=y`;Kconfig/Makefile 接线由工作流手动完成 |
 | **DroidSpaces** | `Patches/Droidspaces/cgroup.patch`(cgroup 前缀隐藏)+ `droidspaces.config` 全量配置片段 |
 | **VFS 后端(可选)** | HybridMount **或** NoMount 二选一,默认都关;见下节 |
@@ -103,6 +106,19 @@ make security/selinux/avc.o   # 生成 security/selinux/flask.h
 ```
 `flask.h` 缺失会直接报 `fatal error: 'flask.h' file not found`。
 
+### 7. SUSFS-LKM 的 `phys_from_virt` 必须识别 PMD 段映射
+4.19 arm64 只有 `pmd_sect()`/`pud_sect()`,没有 5.x 的 `pmd_leaf()`/`pud_leaf()`。
+KASLR 后内核镜像映射在 vmalloc 区,text/rodata(含 `security_hook_heads`)用的是
+2 MiB PMD 段映射;缺少 `#elif defined(pmd_sect)` 分支时 `pmd_bad()` 会把段表项判为
+坏项,`sus_path` 的 LSM hook 插入返回 `-ENOENT`,fatal 层直接拒绝整个模块加载。
+补丁:`Patches/SUSFS-LKM/0006-patch_memory-pmd_sect-pre54.patch`。
+
+### 8. CI 会硬校验模块符号与 vermagic
+`make modules` 对未定义符号只给 WARNING,但 `ksud insmod` 是从 `/proc/kallsyms`
+逐个解析的,解析不到任何一个都会让 `init_module()` 失败。工作流在打包前把
+`ksu.ko`、`susfs_guard_lkm.ko` 的未定义符号对照本次构建的 `System.map`,并检查
+vermagic 是否匹配 `UTS_RELEASE`;不通过直接 fail。
+
 ## Patches
 
 ```
@@ -113,9 +129,14 @@ Patches/
 ├── HybridMount/
 │   └── hybridmount_patch_to_4.19.patch  # Hybrid Mount 4.19 移植(5 新文件 + fs 接线)
 ├── Droidspaces/
-    ├── cgroup.patch                 # cgroup 前缀隐藏(kernfs_create_link)
-    ├── droidspaces.config           # DroidSpaces 内核配置片段(含 IPv6 NAT66)
-    └── fix_restore_cgroup_file_prefix_handling.cocci  # 对照用(coccinelle)
+│   ├── cgroup.patch                 # cgroup 前缀隐藏(kernfs_create_link)
+│   ├── droidspaces.config           # DroidSpaces 内核配置片段(含 IPv6 NAT66)
+│   └── fix_restore_cgroup_file_prefix_handling.cocci  # 对照用(coccinelle)
+├── SUSFS-LKM/
+│   ├── 0001..0004                   # SUSFS-LKM 的 4.19 API/结构适配
+│   ├── 0005-spoof_cmdline-no-bootconfig-pre510.patch
+│   ├── 0006-patch_memory-pmd_sect-pre54.patch
+│   └── README.md                    # 4.19 适配地图与迭代方式
 └── Archive/
     └── README.md                    # 变更存档与踩坑记录
 ```

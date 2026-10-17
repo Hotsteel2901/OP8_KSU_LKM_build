@@ -1,0 +1,29 @@
+diff --git a/kernel/patch_memory.c b/kernel/patch_memory.c
+index 9ff9fff..b66fdb3 100644
+--- a/kernel/patch_memory.c
++++ b/kernel/patch_memory.c
+@@ -47,12 +47,24 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+ #if defined(pud_leaf)
+     if (pud_leaf(*pud))
+         return __pud_to_phys(*pud) + (addr & ~PUD_MASK);
++#elif defined(pud_sect)
++    /* 4.19 arm64 has no pud_leaf(); a PUD-level section mapping is reported by pud_sect(). */
++    if (pud_sect(*pud))
++        return __pud_to_phys(*pud) + (addr & ~PUD_MASK);
+ #endif
+ 
+     pmd = pmd_offset(pud, addr);
+ #if defined(pmd_leaf)
+     if (pmd_leaf(*pmd))
+         return __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
++#elif defined(pmd_sect)
++    /* 4.19 arm64 has no pmd_leaf(); kernel text/rodata (and therefore
++     * security_hook_heads) is mapped with 2 MiB PMD sections.  Without this
++     * branch pmd_bad() rejects the section entry and the LSM hook insertion
++     * fails with -ENOENT ("failed to find phy addr for patch dst ..."), which
++     * makes the fatal sus_path layer refuse to load the whole module. */
++    if (pmd_sect(*pmd))
++        return __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
+ #endif
+     if (pmd_none(*pmd) || pmd_bad(*pmd))
+         goto fail;

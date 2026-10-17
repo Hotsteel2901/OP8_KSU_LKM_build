@@ -445,6 +445,51 @@ jobs:
           fi
           ls -la susfs_guard_lkm.ko
 
+      - name: Verify external modules (unresolved symbols + vermagic)
+        run: |
+          # ksud 会把 .ko 的未定义符号用 /proc/kallsyms 改写成绝对地址，然后调用
+          # init_module()。任何在运行内核里不存在的符号都会让 init_module() 直接
+          # 失败（-ENOENT），但 `make modules` 只打印 WARNING，构建仍然"成功"。
+          # 这里把"符号不存在 / vermagic 不一致"变成硬失败，避免再产出坏 boot.img。
+          set -e
+          OUT="$GITHUB_WORKSPACE/device_kernel/out"
+          SYMS="$OUT/System.map"
+          if [ ! -f "$SYMS" ]; then
+            echo "[i] System.map missing, generating from vmlinux"
+            aarch64-linux-gnu-nm -n "$OUT/vmlinux" > "$SYMS"
+          fi
+          awk '{print $3}' "$SYMS" | grep -v '^$' | sort -u > /tmp/kernel_syms.txt
+          UTS=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' "$OUT/include/generated/utsrelease.h")
+          echo "[i] kernel release: $UTS"
+
+          check_ko() {
+            ko="$1"
+            name=$(basename "$ko")
+            echo "=== $name ==="
+            vm=$(strings "$ko" | sed -n 's/^vermagic=//p' | head -1)
+            echo "[i] vermagic: $vm"
+            case "$vm" in
+              "$UTS "*) ;;
+              *) echo "::error::$name vermagic does not match kernel release '$UTS'"; return 1 ;;
+            esac
+            # Weak undefined symbols (e.g. path_umount on <5.9) are allowed to stay
+            # unresolved; the kernel loader accepts them. Only GLOBAL undefs are fatal.
+            aarch64-linux-gnu-nm -u "$ko" | awk '$1 == "U" {print $2}' | sort -u > /tmp/${name}.undef
+            missing=$(comm -23 /tmp/${name}.undef /tmp/kernel_syms.txt || true)
+            if [ -n "$missing" ]; then
+              echo "::error::$name references symbols missing from the kernel:"
+              echo "$missing" | while IFS= read -r s; do echo "::error::  $s"; done
+              echo "::error::ksud cannot resolve these from /proc/kallsyms; init_module() will fail."
+              return 1
+            fi
+            echo "[+] all $(wc -l < /tmp/${name}.undef) undefined symbols resolved"
+          }
+
+          check_ko "$GITHUB_WORKSPACE/kernelsu/kernel/ksu.ko"
+          if [ "${{ inputs.susfs_enable }}" = "true" ]; then
+            check_ko "$GITHUB_WORKSPACE/susfs_lkm/kernel/susfs_guard_lkm.ko"
+          fi
+
       - name: Package SUSFS-LKM KernelSU module (susfs-lkm-module.zip)
         if: inputs.susfs_enable
         run: |

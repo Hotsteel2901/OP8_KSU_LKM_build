@@ -3,4 +3,4 @@ name=SUSFS-LKM (susfs_guard_lkm.ko)
 version=2.3.0-gki
 versionCode=20300
 author=Hotsteel2901
-description=在开机时通过 ksud 加载外置 susfs_guard_lkm.ko（SUSFS for BakaSU / KernelSU LKM）。日志见 /data/adb/susfs_lkm.log。
+description=Module to load susfs-lkm
